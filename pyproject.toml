@@ -35,3 +35,6 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/probe_api.py" = ["BLE001"]

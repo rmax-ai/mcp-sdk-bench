@@ -10,6 +10,7 @@ import json
 import re
 from importlib.metadata import version as pkg_version
 
+
 def find_spec(mod: str) -> bool:
     return importlib.util.find_spec(mod) is not None
 

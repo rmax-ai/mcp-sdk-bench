@@ -40,12 +40,14 @@ def test_version() -> None:
 
 
 def test_unimplemented_exits_3_with_milestone() -> None:
-    for name in ALL_SUBCOMMANDS:
+    still_stubbed = {"conformance", "interoperability", "extensions", "apps", "skills", "tasks"}
+    for name in still_stubbed:
         r = run_mcpbench(name)
         assert r.returncode == 3, f"{name}: expected exit 3, got {r.returncode}"
         assert "not yet implemented" in r.stdout, name
 
 
-def test_eval_sdk_filter_accepted() -> None:
-    r = run_mcpbench("eval", "--sdk", "fastmcp")
-    assert r.returncode == 3  # unimplemented, but flag parses
+def test_eval_rejects_unknown_sdk() -> None:
+    r = run_mcpbench("eval", "--sdk", "bogus")
+    assert r.returncode == 2
+    assert "unknown sdk" in r.stdout

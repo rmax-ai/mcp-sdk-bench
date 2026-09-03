@@ -76,6 +76,17 @@ def _round_trips(messages: list) -> int:
     )
 
 
+def _token_totals(messages: list) -> tuple[int, int]:
+    """Sum usage_metadata across model messages (langchain AIMessage shape)."""
+    in_tok = out_tok = 0
+    for message in messages:
+        if isinstance(message, AIMessage):
+            usage = getattr(message, "usage_metadata", None) or {}
+            in_tok += int(usage.get("input_tokens") or 0)
+            out_tok += int(usage.get("output_tokens") or 0)
+    return in_tok, out_tok
+
+
 async def run_task(task: dict, adapter: MCPAdapter, agent_graph: Any) -> dict:
     """Execute one task. Returns the skeleton result record; errors are
     captured in `error` rather than raised so one task cannot kill a sweep."""
@@ -95,6 +106,8 @@ async def run_task(task: dict, adapter: MCPAdapter, agent_graph: Any) -> dict:
     except Exception as err:  # noqa: BLE001 — a failed task is data, not a crash; one task must not kill a sweep
         error = str(err)
     total_latency_ms = (time.perf_counter() - start) * 1000
+    mcp_latency_ms = float(state.get("mcp_latency_ms", 0.0))
+    input_tokens, output_tokens = _token_totals(state.get("messages", []))
 
     tool_calls = list(state.get("tool_calls", []))
     # Resource/prompt access recorded by AccessRecordingAdapter surfaces as
@@ -109,7 +122,10 @@ async def run_task(task: dict, adapter: MCPAdapter, agent_graph: Any) -> dict:
         "tool_calls": tool_calls,
         "round_trips": _round_trips(state.get("messages", [])),
         "total_latency_ms": total_latency_ms,
-        "mcp_latency_ms": state.get("mcp_latency_ms", 0.0),
+        "mcp_latency_ms": mcp_latency_ms,
+        "model_latency_ms": total_latency_ms - mcp_latency_ms,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
         "final_answer": _final_answer(state.get("messages", [])),
         "error": error,
     }
