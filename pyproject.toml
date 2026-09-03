@@ -13,6 +13,7 @@ dependencies = [
     "langchain-core>=1.6.1",
     "langgraph>=1.2.11",
     "mcp>=2.1.1",
+    "typer>=0.27.2",
 ]
 
 [project.scripts]
@@ -25,6 +26,11 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
     "ruff>=0.16.6",
     "ty>=0.0.78",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

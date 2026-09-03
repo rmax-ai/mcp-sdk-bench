@@ -1,0 +1,8 @@
+[project]
+name = "mcp-sdk-bench-adk"
+version = "0.1.0"
+description = "ADK variant environment — google-adk[mcp] pins mcp 1.x; kept separate per DECISIONS.md D1"
+requires-python = ">=3.13"
+dependencies = [
+    "google-adk[mcp]>=2.8.0",
+]
