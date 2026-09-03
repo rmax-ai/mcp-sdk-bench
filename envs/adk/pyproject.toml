@@ -5,6 +5,11 @@ description = "ADK variant environment — google-adk[mcp] pins mcp 1.x; kept se
 requires-python = ">=3.13"
 dependencies = [
     "google-adk[mcp]>=2.8.0",
+    # Agent stack (L1/L2) must also import under this env so the ADK variant
+    # can be driven end to end.
+    "langchain-core>=1.6.1",
+    "langchain-openai>=1.6.0",
+    "langgraph>=1.2.11",
     # Direct import (Annotated Field metadata on tool signatures) in
     # mcp_sdk_bench.servers.adk; already transitive via google-adk.
     "pydantic>=2.11",
