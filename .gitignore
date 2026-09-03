@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+
+# Results (keep structure, ignore artifacts)
+results/*
+!results/.gitkeep
+!results/latest/
+results/latest/*
+!results/latest/.gitkeep
+
+# Env / secrets
+.env
+.envrc
+.env.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
