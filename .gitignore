@@ -13,6 +13,7 @@ build/
 # Results (keep structure, ignore artifacts)
 results/*
 !results/.gitkeep
+!results/environment.json
 !results/latest/
 results/latest/*
 !results/latest/.gitkeep

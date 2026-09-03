@@ -1,0 +1,16 @@
+{
+  "date": "2026-09-03",
+  "python": "3.13 (pinned via .python-version)",
+  "fastmcp": "4.0.2 (fastmcp-slim 4.0.2; mcp-types>=2,<3; extras: apps->prefab-ui, tasks->fastmcp-tasks)",
+  "google-adk": "2.8.0 (MCP extra requires mcp>=1.24,<2 — separate env)",
+  "mcp": "2.1.1 (official Python SDK v2; LATEST_PROTOCOL_VERSION=2026-07-28)",
+  "langgraph": "1.2.11",
+  "langchain-core": "1.6.1",
+  "protocol": "2026-07-28",
+  "dev": {
+    "ruff": "0.16.6",
+    "ty": "0.0.78",
+    "pytest": "9.1.1"
+  },
+  "notes": "ADK env must pin mcp 1.x (google-adk[mcp]); FastMCP 4 is decoupled from the official SDK runtime (mcp-types only); official SDK shows no MCP Apps types in 2.1.1"
+}

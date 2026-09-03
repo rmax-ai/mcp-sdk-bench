@@ -1,0 +1,30 @@
+[project]
+name = "mcp-sdk-bench"
+version = "0.1.0"
+description = "Executable benchmark: FastMCP 4.x vs Google ADK vs official MCP Python SDK v2"
+readme = "README.md"
+authors = [
+    { name = "R Max Espinoza", email = "hey@rmax.dev" },
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastmcp>=4.0.2",
+    "google-adk>=2.8.0",
+    "langchain-core>=1.6.1",
+    "langgraph>=1.2.11",
+    "mcp>=2.1.1",
+]
+
+[project.scripts]
+mcpbench = "mcp_sdk_bench.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.13,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.6",
+    "ty>=0.0.78",
+]
