@@ -5,4 +5,15 @@ description = "ADK variant environment — google-adk[mcp] pins mcp 1.x; kept se
 requires-python = ">=3.13"
 dependencies = [
     "google-adk[mcp]>=2.8.0",
+    # Direct import (Annotated Field metadata on tool signatures) in
+    # mcp_sdk_bench.servers.adk; already transitive via google-adk.
+    "pydantic>=2.11",
+]
+
+# Needed so `uv run --project envs/adk pytest tests/conformance/test_adk_variant.py`
+# works (the ADK client smoke only runs in this env).
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
 ]
