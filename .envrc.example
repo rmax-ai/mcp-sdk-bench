@@ -1,0 +1,5 @@
+# Copy to .envrc, fill values, run `direnv allow`.
+# Loaded per-session; never committed (real values live only in .envrc).
+export MODEL_PROVIDER=
+export MODEL_NAME=
+export MODEL_API_KEY=

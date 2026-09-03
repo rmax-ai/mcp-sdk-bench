@@ -16,7 +16,7 @@ Project DNA: an evidence-first benchmark comparing **FastMCP 4.x**, **Google ADK
 ## Repo conventions
 
 - `uv` + src layout. `uv.lock` is **committed** (benchmark reproducibility — this is an app, not a library).
-- Lint/type/test: ruff, pyright (or mypy — pinned at bootstrap), pytest. Deterministic seeds everywhere.
+- Lint/type/test: ruff → ty → pytest (pinned 0.16.6 / 0.0.78 / 9.1.1 — see DECISIONS.md D5). Deterministic seeds everywhere.
 - Tests mirror SPEC.md §8: `tests/conformance/` (discovery, schema, errors, concurrency, lifecycle), `tests/interoperability/`, `tests/failures/`, `tests/regression/`.
 - Datasets are JSONL with stable task IDs. Results keyed by `run_id` + `sdk`. `results/` is gitignored except `.gitkeep`; `results/latest/` is the canonical report artifact.
 - Traces follow SPEC.md §22 format, exported as JSONL.
