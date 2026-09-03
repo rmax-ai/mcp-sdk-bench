@@ -30,3 +30,4 @@ results/latest/*
 
 # OS
 .DS_Store
+.serena/
