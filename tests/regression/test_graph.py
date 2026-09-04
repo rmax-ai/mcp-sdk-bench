@@ -123,6 +123,79 @@ async def test_max_tool_iterations_caps_an_infinite_tool_call_loop() -> None:
     assert len(adapter.calls) == MAX_TOOL_ITERATIONS
 
 
+async def test_host_mediated_read_resource_dispatch() -> None:
+    """read_resource pseudo-tool must route to adapter.read_resource (host role)."""
+
+    class ResourceStubAdapter(StubAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resource_reads: list[str] = []
+
+        async def read_resource(self, uri: str) -> str:
+            self.resource_reads.append(uri)
+            return "# Deployment Policy\ncheckout is under change freeze."
+
+    model = BindableFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"name": "read_resource", "args": {"uri": "company://policies/deployment"}, "id": "call-r1"}
+                    ],
+                ),
+                AIMessage(content="checkout is under change freeze."),
+            ]
+        )
+    )
+    adapter = ResourceStubAdapter()
+    graph = build_agent(TOOL_SPECS, adapter, model=model)
+
+    final = await graph.ainvoke(
+        _initial_state("Can checkout be deployed?"),
+        config={"recursion_limit": RECURSION_LIMIT},
+    )
+
+    assert adapter.resource_reads == ["company://policies/deployment"]
+    assert adapter.calls == []  # no MCP tool call was made
+    assert final["tool_calls"] == [
+        {"name": "read_resource", "arguments": {"uri": "company://policies/deployment"}}
+    ]
+    assert final["messages"][-1].content == "checkout is under change freeze."
+
+
+async def test_host_mediated_read_resource_error_is_tool_error() -> None:
+    """A failing resource read must surface as a tool error, not a crash."""
+
+    class FailingResourceAdapter(StubAdapter):
+        async def read_resource(self, uri: str) -> str:
+            raise RuntimeError("unknown resource URI")
+
+    model = BindableFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"name": "read_resource", "args": {"uri": "company://nope"}, "id": "call-r2"}
+                    ],
+                ),
+                AIMessage(content="I could not read that resource."),
+            ]
+        )
+    )
+    adapter = FailingResourceAdapter()
+    graph = build_agent(TOOL_SPECS, adapter, model=model)
+
+    final = await graph.ainvoke(
+        _initial_state("read the policy"),
+        config={"recursion_limit": RECURSION_LIMIT},
+    )
+
+    tool_message = final["messages"][-2]
+    assert "unknown resource URI" in tool_message.content
+
+
 async def test_run_task_records_result_shape() -> None:
     model = BindableFakeChatModel(
         messages=iter([_tool_call_message(), AIMessage(content="PAY-123 is OPEN.")])

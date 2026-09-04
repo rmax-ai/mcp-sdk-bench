@@ -23,7 +23,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
-from mcp_sdk_bench.adapters.base import MCPAdapter, ToolSpec
+from mcp_sdk_bench.adapters.base import MCPAdapter, ToolResult, ToolSpec
 from mcp_sdk_bench.agent.prompts import SYSTEM_PROMPT
 
 MAX_TOOL_ITERATIONS = 12
@@ -116,10 +116,30 @@ def build_agent(
         out_calls: list[dict] = []
         latency_ms = 0.0
         for call in last.tool_calls:
+            name = call["name"]
             start = time.perf_counter()
-            result = await adapter.call_tool(call["name"], call["args"])
+            # Host-mediated MCP primitives (the agent loop plays the MCP host
+            # role — SPEC.md §2): resources and prompts are not function tools
+            # on the wire, so the host surfaces them as read-only pseudo-tools.
+            if name == "read_resource":
+                uri = (call["args"] or {}).get("uri", "")
+                try:
+                    text = await adapter.read_resource(uri)
+                    result = ToolResult(is_error=False, text=text)
+                except Exception as err:  # noqa: BLE001 — server errors are tool results
+                    result = ToolResult(is_error=True, text=str(err))
+            elif name == "get_prompt":
+                args = dict(call["args"] or {})
+                prompt_name = args.pop("name", "")
+                try:
+                    text = await adapter.get_prompt(prompt_name, args)
+                    result = ToolResult(is_error=False, text=text)
+                except Exception as err:  # noqa: BLE001
+                    result = ToolResult(is_error=True, text=str(err))
+            else:
+                result = await adapter.call_tool(name, call["args"])
             latency_ms += (time.perf_counter() - start) * 1000
-            out_calls.append({"name": call["name"], "arguments": call["args"]})
+            out_calls.append({"name": name, "arguments": call["args"]})
             content = (
                 f"Tool error: {result.text}"
                 if result.is_error

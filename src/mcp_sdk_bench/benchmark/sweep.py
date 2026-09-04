@@ -1,11 +1,17 @@
-"""Eval sweep orchestration: one SDK, one adapter, full dataset, graders, traces.
+"""Eval sweep orchestration: one SDK, one adapter per task, graders, traces.
 
-Wired into `mcpbench eval --sdk <sdk>` and `mcpbench benchmark`.
+Per-task world isolation (SPEC.md §23): a fresh adapter + server process per
+task gives every task an untouched world. The model is constructed once per
+sweep (agent identity stays pinned); the graph is rebuilt per task because it
+closes over the adapter. Resources/prompts are surfaced as host-mediated
+pseudo-tools (the benchmark agent plays the MCP host role, SPEC.md §2).
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +22,8 @@ from mcp_sdk_bench.adapters import (
     MCPAdapter,
     OfficialAdapter,
 )
-from mcp_sdk_bench.agent.graph import build_agent
+from mcp_sdk_bench.adapters.base import ToolSpec
+from mcp_sdk_bench.agent.graph import build_agent, build_model
 from mcp_sdk_bench.benchmark.metrics import assemble
 from mcp_sdk_bench.benchmark.result import (
     run_dir,
@@ -37,13 +44,34 @@ _ADAPTER_CLASSES: dict[str, Any] = {
     "adk": AdkAdapter,
 }
 
+READ_RESOURCE_SPEC = ToolSpec(
+    name="read_resource",
+    description=(
+        "Read an MCP resource by URI (host-mediated resource access). "
+        "Use for company policies and documents."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {"uri": {"type": "string", "description": "Resource URI, e.g. company://policies/deployment"}},
+        "required": ["uri"],
+    },
+)
+
+GET_PROMPT_SPEC = ToolSpec(
+    name="get_prompt",
+    description="Render an MCP prompt template by name (host-mediated prompt access).",
+    input_schema={
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}},
+        "required": ["name"],
+    },
+)
+
 
 def environment_snapshot() -> dict:
     env: dict[str, Any] = {"model_name": os.environ.get("MODEL_NAME"), "model_provider": os.environ.get("MODEL_PROVIDER")}
     env_file = REPO_ROOT / "results" / "environment.json"
     if env_file.exists():
-        import json
-
         env["pinned"] = json.loads(env_file.read_text())
     return env
 
@@ -60,25 +88,38 @@ async def run_sweep(sdk: str, run_id: str) -> tuple[list[dict], dict]:
     for path in DATASET_PATHS:
         tasks.extend(row.model_dump() for row in load_dataset(path))
 
-    adapter: MCPAdapter = adapter_cls()
-    recording = AccessRecordingAdapter(adapter)
+    model = build_model()  # once per sweep — agent identity pinned (SPEC §23)
     trace = TraceRecorder(run_id, sdk)
     trace.record("run.start", model=os.environ.get("MODEL_NAME", "unset"))
 
-    discovery = await adapter.connect()
+    # Discovery once (probe), snapshot for capabilities + agent tool list.
+    probe = adapter_cls()
+    try:
+        discovery = await probe.connect()
+    finally:
+        await probe.close()
     trace.record(
         "mcp.discover",
         tools=[t.name for t in discovery.tools],
         resources=[r.uri for r in discovery.resources],
         prompts=[p.name for p in discovery.prompts],
     )
-    graph = build_agent(list(discovery.tools), recording)
+    agent_tools: list[ToolSpec] = list(discovery.tools)
+    if discovery.resources:
+        agent_tools.append(READ_RESOURCE_SPEC)
+    if discovery.prompts:
+        agent_tools.append(GET_PROMPT_SPEC)
 
     records: list[dict] = []
-    try:
-        for row in tasks:
-            task = {**row, "sdk": sdk}
-            trace.record("task.start", task_id=row["id"], category=row.get("category"))
+    for row in tasks:
+        task = {**row, "sdk": sdk}
+        adapter: MCPAdapter = adapter_cls()
+        recording = AccessRecordingAdapter(adapter)
+        trace.record("task.start", task_id=row["id"], category=row.get("category"))
+        connect_start = time.perf_counter()
+        try:
+            await adapter.connect()
+            graph = build_agent(agent_tools, recording, model=model)
             result = await run_task(task, recording, graph)
             for call in result["tool_calls"]:
                 trace.record("mcp.tool_call", task_id=row["id"], tool=call.get("name"), arguments=call.get("arguments"))
@@ -86,10 +127,11 @@ async def run_sweep(sdk: str, run_id: str) -> tuple[list[dict], dict]:
                 trace.record("error", task_id=row["id"], message=result["error"])
             verdict = await grade_task(task, result, adapter)
             record = assemble(task, result, verdict)
+            record["total_latency_ms"] = float(record["total_latency_ms"]) + (time.perf_counter() - connect_start) * 1000
             records.append(record)
             trace.record("task.end", task_id=row["id"], task_success=record["task_success"])
-    finally:
-        await adapter.close()
+        finally:
+            await adapter.close()
 
     trace.write(run_dir(run_id) / f"trace-{sdk}.jsonl")
 
