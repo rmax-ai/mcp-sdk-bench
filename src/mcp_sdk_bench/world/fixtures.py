@@ -50,6 +50,14 @@ def seed_world() -> World:
                 assignee="alice",
                 description="Resolved by rolling back the gateway config.",
             ),
+            # M2.3b: fail-03 updates PAY-124 under fault injection.
+            "PAY-124": Ticket(
+                id="PAY-124",
+                title="Refund backlog spike",
+                status=TicketStatus.OPEN,
+                team="payments",
+                description="Refund queue grew 3x after the 1.8.2 release; needs triage.",
+            ),
         },
         documents={
             "dep-policy": Document(

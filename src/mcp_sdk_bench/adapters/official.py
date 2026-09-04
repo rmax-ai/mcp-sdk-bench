@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters, types
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import get_default_environment, stdio_client
 from mcp.shared.exceptions import MCPError
 
 from mcp_sdk_bench.adapters.base import (
@@ -33,7 +33,11 @@ def _text_of(content: list) -> str:
 
 
 class OfficialAdapter(MCPAdapter):
-    def __init__(self) -> None:
+    def __init__(self, env: dict[str, str] | None = None) -> None:
+        #: Extra env vars merged over the SDK default subprocess environment
+        #: (M2.3b fault injection, SPEC.md §21). StdioServerParameters env
+        #: REPLACES the default env, so the merge happens here.
+        self._env = env
         self._stdio_cm = None
         self._session_cm = None
         self._session: ClientSession | None = None
@@ -43,6 +47,7 @@ class OfficialAdapter(MCPAdapter):
             command=sys.executable,
             args=["-m", "mcp_sdk_bench.servers.official"],
             cwd=str(REPO_ROOT),
+            env=({**get_default_environment(), **self._env} if self._env else None),
         )
         self._stdio_cm = stdio_client(params)
         read_stream, write_stream = await self._stdio_cm.__aenter__()

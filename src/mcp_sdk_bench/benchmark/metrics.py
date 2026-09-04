@@ -28,6 +28,32 @@ _RUN_FIELDS = (
     "output_tokens",
 )
 
+# M2.3b reliability counters (SPEC.md §21). Populated by
+# benchmark.reliability for failure-injection runs; None on M1 eval runs
+# (honest absence, never a fabricated 0).
+_RELIABILITY_FIELDS = (
+    "retry_count",
+    "duplicate_side_effects",
+    "recovery",
+)
+
+
+def retry_count(call_log: list[dict]) -> int:
+    """Repeat calls to the same tool with the same arguments (SPEC.md §21).
+
+    A retry is any call whose (name, args_hash) pair was already seen in this
+    run: N identical calls contribute N-1 retries. Under fault injection
+    retries are correct recovery behavior — a metric, never a failure.
+    """
+    seen: dict[tuple[str, str], int] = {}
+    retries = 0
+    for entry in call_log:
+        key = (str(entry.get("name")), str(entry.get("args_hash")))
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            retries += 1
+    return retries
+
 
 def assemble(task: dict, run_result: dict, verdict: dict) -> dict[str, Any]:
     record: dict[str, Any] = {
@@ -48,6 +74,10 @@ def assemble(task: dict, run_result: dict, verdict: dict) -> dict[str, Any]:
     record["error_recovery_success"] = None
     record["protocol_errors"] = None
     record["user_interactions"] = None
+    # M2.3b reliability counters: taken from the run result when the
+    # reliability experiment populated them, else None (honest absence).
+    for field in _RELIABILITY_FIELDS:
+        record[field] = run_result.get(field)
     return record
 
 
@@ -76,4 +106,9 @@ def aggregate(records: list[dict]) -> dict[str, Any]:
         "mean_model_latency_ms": mean("model_latency_ms"),
         "mean_input_tokens": mean("input_tokens"),
         "mean_output_tokens": mean("output_tokens"),
+        # M2.3b reliability aggregates (None when unobserved — e.g. M1 runs).
+        # `recovery` is bool; bools aggregate as 0/1 via isinstance(int).
+        "mean_retry_count": mean("retry_count"),
+        "mean_duplicate_side_effects": mean("duplicate_side_effects"),
+        "recovery_rate": mean("recovery"),
     }

@@ -14,6 +14,7 @@ from pathlib import Path
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
 from mcp import types
+from mcp.client.stdio import get_default_environment
 
 from mcp_sdk_bench.adapters.base import (
     Discovery,
@@ -34,10 +35,13 @@ def _text_of(content: list) -> str:
 
 
 class FastMCPAdapter(MCPAdapter):
-    def __init__(self) -> None:
+    def __init__(self, env: dict[str, str] | None = None) -> None:
+        # `env`: extra env vars merged over the SDK default subprocess
+        # environment (M2.3b fault injection, SPEC.md §21).
         transport = StdioTransport(
             command=sys.executable,
             args=["-m", "mcp_sdk_bench.servers.fastmcp"],
+            env=({**get_default_environment(), **env} if env else None),
             cwd=str(REPO_ROOT),
         )
         self._client: Client = Client(transport)

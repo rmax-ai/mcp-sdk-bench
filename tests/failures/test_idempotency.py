@@ -53,7 +53,7 @@ from mcp_sdk_bench.world import Ticket, WorldError, reset_world
 FAIL_AFTER_ENV = {"FAIL_TOOL_CALL": "1.0", "FAIL_PHASE": "after", "FAULT_SEED": "42"}
 
 CREATE_ARGS = {"ticket_id": "T-1", "title": "Onboard new engineer", "idempotency_key": "K-1"}
-SEEDED_TICKETS = 3  # fixtures.py: PAY-123, RISK-88, PAY-456
+SEEDED_TICKETS = 4  # fixtures.py: PAY-123, RISK-88, PAY-456, PAY-124 (M2.3b)
 
 
 def _text(result: Any) -> str:
