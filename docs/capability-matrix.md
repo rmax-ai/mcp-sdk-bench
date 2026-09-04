@@ -58,3 +58,15 @@ Non-pass cells: none. Two honest caveats, both run-verified rather than hidden:
 
 - **ADK client pairings see tools only.** `McpToolset` has no first-class MCP resource/prompt surface (M1 finding), so `resources_seen`/`prompts_seen` are 0 for ADK client rows — absence of a client surface, not a server deficiency (both servers serve the deployment-policy resource and incident-triage prompt, proven by the FastMCP/official client rows).
 - **ADK protocol versions are proxy-captured.** `McpToolset` exposes no initialize result, so the ADK rows' versions come solely from the wire log (harness limitation, recorded as `exposes_protocol_version=False` in `tests/conformance/helpers.py` DISCOVERY_CONTRACT).
+
+## Reliability under deterministic fault injection (M2.3, N=3 + N=10 verdict)
+
+Run-verified against `tests/failures/` and `results/latest/failures*.json` (2026-09-04, deepseek-v4-flash).
+
+| SDK | baseline | fail-before | fail-after | latency | idempotency (N=10, fail-after) |
+|---|---|---|---|---|---|
+| official | 0.80 | 0.87 | 0.80 | 0.87 | 10/10 success, 0 dups |
+| fastmcp | 0.80 | 0.73 | 0.67 | 0.80 | 10/10 success, 0 dups |
+| adk | 0.80 | 0.73 | 0.73 | 0.87 | 10/10 success, 0 dups |
+
+Wire-level fault injection (drop/malformed): exercisable for official + fastmcp via the StdioProxy; not injectable for ADK (`McpToolset` SDK-managed channel — documented harness limitation, tool-layer faults still apply). See docs/findings.md.
