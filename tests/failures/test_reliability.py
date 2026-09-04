@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 
@@ -420,3 +421,31 @@ def test_fault_config_label_includes_active_knobs() -> None:
 
     baseline = fault_config_label(FaultConfig())
     assert baseline.startswith("baseline:")
+
+
+def test_model_outage_guard_raises_on_all_error_records() -> None:
+    """A cell where every run errored with zero tool calls is a model-backend
+    outage, not data — the guard must raise (regression, 2026-09-04:
+    DeepSeek balance hit zero mid-experiment and cells recorded 0.00 rows)."""
+    from mcp_sdk_bench.benchmark.reliability import _raise_if_model_outage
+
+    with pytest.raises(RuntimeError, match="model backend failure in fastmcp/FAIL_BEFORE"):
+        _raise_if_model_outage(
+            [{"error": "Error code: 402 - Insufficient Balance", "tool_call_count": 0}] * 2,
+            "fastmcp",
+            "FAIL_BEFORE",
+        )
+
+
+def test_model_outage_guard_passes_with_any_completed_run() -> None:
+    from mcp_sdk_bench.benchmark.reliability import _raise_if_model_outage
+
+    # One healthy run in the cell → legitimate data, no raise.
+    _raise_if_model_outage(
+        [
+            {"error": None, "tool_call_count": 3},
+            {"error": "Error code: 402 - Insufficient Balance", "tool_call_count": 0},
+        ],
+        "official",
+        "FAIL_AFTER",
+    )

@@ -539,4 +539,21 @@ async def run_reliability(
                     }
                 )
                 records.append(record)
+
+    _raise_if_model_outage(records, sdk, label)
     return records
+
+
+def _raise_if_model_outage(records: list[dict], sdk: str, label: str) -> None:
+    """Fail-loud guard: if EVERY run in the cell errored before any tool call
+    (model backend outage — 402 insufficient balance, 429, auth, etc.), the
+    cell must raise, not record a plausible-looking 0.00 row. Silent
+    all-failure rows are fabricated evidence (proven 2026-09-04: DeepSeek
+    balance hit zero mid-experiment and three SDK legs recorded 0.00
+    success / 0.60 bad_state as if they were findings)."""
+    if records and all(r.get("error") and r.get("tool_call_count") == 0 for r in records):
+        first_error = records[0]["error"]
+        raise RuntimeError(
+            f"model backend failure in {sdk}/{label}: all {len(records)} runs "
+            f"errored with zero tool calls — first error: {first_error!r}"
+        )
