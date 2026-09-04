@@ -46,6 +46,8 @@ Design rationale. Each entry: decision, why, what was rejected.
 
 **Decision:** build the conformance layer on `rmax-ai/mcp-conformance` (scenario-driven runner) and/or `rmax-ai/mcph` (MCP-Hurl DSL); the §19 auth experiment on `rmax-ai/mcp-auth-test-server` (OAuth 1.0a/2.0/2.1/Bearer test endpoints). Reuse over reinvention; cite, don't fork silently.
 
+**M2.1 addendum (2026-09-04):** the conformance suite landed as native pytest in `tests/conformance/` with a deterministic stdio corrupting/delaying/dropping proxy (`helpers.py StdioProxy`), not by embedding mcph/mcp-conformance. Rationale: the world is stdio-subprocess servers driven through each SDK's own client — mcph targets stdio but its DSL+runner would add a cross-repo runtime dep for assertions the native suite already encodes per-candidate; mcp-conformance's scenario runner is HTTP-partner oriented and a poor fit. Prior art consulted and credited in module docstrings; M2.1 keeps the wire-level checks (malformed frames, connection loss, timeouts) that motivated D8.
+
 ## D9 — Results policy
 
 **Decision:** `results/environment.json` is committed (environment pin record). `results/latest/*` is generated output — regenerated per run, not hand-edited.
