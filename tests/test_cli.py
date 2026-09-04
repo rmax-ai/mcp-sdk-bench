@@ -16,6 +16,7 @@ def run_mcpbench(*args: str) -> subprocess.CompletedProcess[str]:
 ALL_SUBCOMMANDS = {
     "capabilities",
     "conformance",
+    "interop",
     "interoperability",
     "eval",
     "extensions",
@@ -40,7 +41,7 @@ def test_version() -> None:
 
 
 def test_unimplemented_exits_3_with_milestone() -> None:
-    still_stubbed = {"conformance", "interoperability", "extensions", "apps", "skills", "tasks"}
+    still_stubbed = {"conformance", "extensions", "apps", "skills", "tasks"}
     for name in still_stubbed:
         r = run_mcpbench(name)
         assert r.returncode == 3, f"{name}: expected exit 3, got {r.returncode}"

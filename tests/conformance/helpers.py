@@ -12,12 +12,17 @@ Contents:
   the benchmark adapter (src/mcp_sdk_bench/adapters/adk.py): ADK 2.8 ships no
   standalone protocol client, so the adapter IS the canonical driving surface.
 - StdioProxy: a deterministic stdio JSON-RPC proxy with corrupt/delay/drop
-  fault modes, run as a subprocess between client and server. Wire-level
-  faults apply only to the official and FastMCP candidates; the ADK adapter
-  drives its server through an SDK-managed channel with no wire access.
+  fault modes plus a "log" mode (M2.2) that passes frames through untouched
+  while recording every JSON-RPC frame (both directions) to a JSONL file for
+  wire-level version-negotiation evidence. Run as a subprocess between client
+  and server. Wire-level faults apply only to the official and FastMCP
+  candidates; the ADK adapter drives its server through an SDK-managed
+  channel with no wire access.
 
 This module doubles as the proxy executable:
     python tests/conformance/helpers.py --mode corrupt --nth 2 -- \
+        python -m mcp_sdk_bench.servers.official
+    python tests/conformance/helpers.py --mode log --log-file wire.jsonl -- \
         python -m mcp_sdk_bench.servers.official
 """
 from __future__ import annotations
@@ -151,7 +156,7 @@ def harness_issue(candidate: str, what: str) -> str:
 
 # ---- stdio fault-injection proxy (SPEC.md §8 ERRORS / LIFECYCLE) ----
 
-PROXY_MODES = ("corrupt", "delay", "drop")
+PROXY_MODES = ("corrupt", "delay", "drop", "log")
 
 HELPERS_PATH = Path(__file__).resolve()
 
@@ -172,6 +177,10 @@ class ProxyFault:
         response frame.
     mode="drop": forward the Nth response frame, then close both pipes
         (the proxy exits, killing the server child).
+    mode="log": no fault — every frame is forwarded verbatim AND appended
+        (flushed per line) to `log_file` as JSONL records of the form
+        {"direction": "c2s"|"s2c", "frame": <parsed JSON-RPC frame>}.
+        Required for the M2.2 version-negotiation wire evidence.
 
     "Nth response frame" counts only server-to-client JSON-RPC responses
     (frames carrying "id" plus "result" or "error"); notifications and
@@ -181,12 +190,15 @@ class ProxyFault:
     mode: str
     nth: int = 1
     delay_ms: int = 250
+    log_file: Path | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in PROXY_MODES:
             raise ValueError(f"unknown proxy mode {self.mode!r}; expected one of {PROXY_MODES}")
         if self.nth < 1:
             raise ValueError("nth is 1-based and must be >= 1")
+        if self.mode == "log" and self.log_file is None:
+            raise ValueError("log mode requires log_file")
 
 
 class StdioProxy:
@@ -200,6 +212,19 @@ class StdioProxy:
         self.fault = fault
         self.responses_seen = 0
         self._child: asyncio.subprocess.Process | None = None
+        self._log: Any = None
+
+    def _record(self, direction: str, line: bytes) -> None:
+        """Log mode only: append one JSONL record per frame, flushed so the
+        wire evidence survives the client killing the proxy at teardown."""
+        if self._log is None:
+            return
+        try:
+            frame: Any = json.loads(line)
+        except ValueError:
+            frame = {"raw": line.decode("utf-8", errors="replace")}
+        self._log.write(json.dumps({"direction": direction, "frame": frame}) + "\n")
+        self._log.flush()
 
     @staticmethod
     def _is_response_frame(line: bytes) -> bool:
@@ -214,6 +239,12 @@ class StdioProxy:
         )
 
     async def run(self) -> int:
+        if self.fault.mode == "log" and self.fault.log_file is not None:
+            # Blocking open in an async def is deliberate: one short-lived
+            # append handle per proxy process, opened before any frame flows.
+            self._log = open(  # noqa: SIM115, ASYNC230 — closed in the finally below
+                self.fault.log_file, "a", encoding="utf-8"
+            )
         self._child = await asyncio.create_subprocess_exec(
             *self.command,
             stdin=asyncio.subprocess.PIPE,
@@ -233,6 +264,9 @@ class StdioProxy:
             with contextlib.suppress(asyncio.CancelledError):
                 await pump
             await self._terminate_child()
+            if self._log is not None:
+                self._log.close()
+                self._log = None
         return 0
 
     async def _forward_requests(self, reader: asyncio.StreamReader) -> None:
@@ -243,6 +277,7 @@ class StdioProxy:
                 line = await reader.readline()
                 if not line:
                     break
+                self._record("c2s", line)
                 stdin.write(line)
                 await stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
@@ -258,6 +293,7 @@ class StdioProxy:
             line = await self._child.stdout.readline()
             if not line:
                 return  # server exited on its own; pass EOF through by exiting
+            self._record("s2c", line)
             is_response = self._is_response_frame(line)
             if is_response:
                 self.responses_seen += 1
@@ -312,7 +348,7 @@ def proxy_args(server_args: list[str], fault: ProxyFault | None) -> list[str]:
     """Build the subprocess args for a (possibly proxied) stdio server."""
     if fault is None:
         return list(server_args)
-    return [
+    args = [
         str(HELPERS_PATH),
         "--mode",
         fault.mode,
@@ -320,10 +356,10 @@ def proxy_args(server_args: list[str], fault: ProxyFault | None) -> list[str]:
         str(fault.nth),
         "--delay-ms",
         str(fault.delay_ms),
-        "--",
-        sys.executable,
-        *server_args,
     ]
+    if fault.log_file is not None:
+        args += ["--log-file", str(fault.log_file)]
+    return [*args, "--", sys.executable, *server_args]
 
 
 # ---- session factories (fresh server subprocess per session) ----
@@ -335,12 +371,14 @@ async def OFFICIAL_SESSION(
     fault: ProxyFault | None = None,
     read_timeout_seconds: float | None = None,
     message_handler: Callable[..., Any] | None = None,
+    server_args: list[str] | None = None,
 ) -> AsyncIterator[ClientSession]:
     """Official SDK ClientSession over stdio against a fresh official server
-    (optionally behind a StdioProxy fault)."""
+    (optionally behind a StdioProxy fault). `server_args` overrides the
+    server subprocess for cross-implementation pairings (M2.2)."""
     params = StdioServerParameters(
         command=sys.executable,
-        args=proxy_args(OFFICIAL_SERVER_ARGS, fault),
+        args=proxy_args(server_args or OFFICIAL_SERVER_ARGS, fault),
     )
     session_kwargs: dict[str, Any] = {}
     if read_timeout_seconds is not None:
@@ -360,15 +398,18 @@ async def FAST_MCP_SESSION(
     *,
     fault: ProxyFault | None = None,
     message_handler: Callable[..., Any] | None = None,
+    server_args: list[str] | None = None,
 ) -> AsyncIterator[Any]:
     """FastMCP Client (fastmcp.client.Client) over stdio against a fresh
-    FastMCP server subprocess (optionally behind a StdioProxy fault)."""
+    FastMCP server subprocess (optionally behind a StdioProxy fault).
+    `server_args` overrides the server subprocess for cross-implementation
+    pairings (M2.2)."""
     from fastmcp import Client
     from fastmcp.client.transports import StdioTransport
 
     transport = StdioTransport(
         command=sys.executable,
-        args=proxy_args(FASTMCP_SERVER_ARGS, fault),
+        args=proxy_args(server_args or FASTMCP_SERVER_ARGS, fault),
         keep_alive=False,
     )
     client_kwargs: dict[str, Any] = {}
@@ -411,6 +452,12 @@ def _main(argv: list[str]) -> int:
     parser.add_argument("--mode", choices=PROXY_MODES, required=True)
     parser.add_argument("--nth", type=int, default=1)
     parser.add_argument("--delay-ms", type=int, default=250)
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="log mode: JSONL destination for every proxied frame",
+    )
     args = parser.parse_args(argv[:sep])
     command = argv[sep + 1 :]
     if not command:
@@ -418,7 +465,9 @@ def _main(argv: list[str]) -> int:
         return 2
     proxy = StdioProxy(
         command=command,
-        fault=ProxyFault(mode=args.mode, nth=args.nth, delay_ms=args.delay_ms),
+        fault=ProxyFault(
+            mode=args.mode, nth=args.nth, delay_ms=args.delay_ms, log_file=args.log_file
+        ),
     )
     return asyncio.run(proxy.run())
 

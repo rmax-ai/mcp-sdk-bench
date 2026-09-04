@@ -106,10 +106,42 @@ def conformance() -> None:
     _not_implemented("M2")
 
 
+def _run_interop() -> list[dict]:
+    from mcp_sdk_bench.benchmark.interop import run_interop
+
+    results = run_interop()
+    typer.echo(
+        f"{'pairing':<20} {'conn':>5} {'client-ver':>11} {'server-ver':>11} "
+        f"{'disc':>5} {'rtrip':>6} {'classification':>20}"
+    )
+    for r in results:
+        typer.echo(
+            f"{r['pairing']:<20} {r['connected']!s:>5} "
+            f"{r['protocol_version_client'] or '-':>11} "
+            f"{r['protocol_version_server'] or '-':>11} "
+            f"{r['discovery_ok']!s:>5} {r['roundtrip_ok']!s:>6} "
+            f"{r['classification']:>20}"
+        )
+        if r["error"]:
+            typer.echo(f"  error: {r['error']}")
+    typer.echo("mcpbench: interoperability matrix written to results/latest/interoperability.json")
+    return results
+
+
+@app.command()
+def interop() -> None:
+    """Run the cross-implementation client/server pairing matrix (SPEC.md §8)."""
+    results = _run_interop()
+    if any(r["classification"] != "pass" for r in results):
+        raise typer.Exit(code=1)
+
+
 @app.command()
 def interoperability() -> None:
-    """Run cross-implementation client/server pairings (SPEC.md §8)."""
-    _not_implemented("M2")
+    """Alias for `interop` (SPEC.md §8 INTEROPERABILITY)."""
+    results = _run_interop()
+    if any(r["classification"] != "pass" for r in results):
+        raise typer.Exit(code=1)
 
 
 @app.command()
