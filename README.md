@@ -8,8 +8,8 @@ Not a tutorial. Not a feature-comparison article. The deliverable is **falsifiab
 
 | Milestone | Scope | Status |
 |---|---|---|
-| M1 | Vertical slice: 3 integrations, shared world, 5 tools/1 resource/1 prompt, LangGraph agent, 10 eval tasks, graders, traces, report | 🔨 next |
-| M2 | Failure injection + full conformance + cross-implementation interoperability | — |
+| M1 | Vertical slice: 3 integrations, shared world, 5 tools/1 resource/1 prompt, LangGraph agent, 11 eval tasks, graders, traces, report | ✅ acceptance passed (2026-09-04) |
+| M2 | Failure injection + full conformance + cross-implementation interoperability | 🔨 next |
 | M3 | Elicitation + multi-round-trip + Tasks | — |
 | M4 | MCP Apps + custom extension `io.mcpbench.audit` | — |
 | M5 | Skills over MCP + progressive disclosure + multi-server + auth/identity | — |

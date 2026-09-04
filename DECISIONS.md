@@ -58,6 +58,6 @@ Design rationale. Each entry: decision, why, what was rejected.
 
 **Decision:** deterministic state graders first (correct final state > textual answer); outcome and trajectory scored independently (SPEC §11); LLM judge only where state inspection genuinely cannot grade.
 
-## D12 — Model budget
+## D12 — Model for benchmark runs (decided)
 
-**Decision (provisional, finalized at M1):** ~1,200 agent runs (N=10 × 40 tasks × 3 SDKs). Main runs on the cheapest capable OpenAI-compatible model; a stronger model validates a smoke subset. Model comparison is out of scope — model identity is pinned, never a variable.
+**Decision:** main runs on `deepseek-v4-flash`, smoke subset on `deepseek-v4-pro` (user directive 2026-09-03). Configured via `.envrc` (MODEL_PROVIDER=deepseek, MODEL_NAME, MODEL_API_KEY from pass). Model identity is pinned per run and recorded in `results/latest/summary.json` environment block — never a variable.
