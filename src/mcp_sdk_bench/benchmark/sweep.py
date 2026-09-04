@@ -24,6 +24,7 @@ from mcp_sdk_bench.adapters import (
 )
 from mcp_sdk_bench.adapters.base import ToolSpec
 from mcp_sdk_bench.agent.graph import build_agent, build_model
+from mcp_sdk_bench.agent.simulator import ScriptedUserSimulator
 from mcp_sdk_bench.benchmark.metrics import assemble
 from mcp_sdk_bench.benchmark.result import (
     run_dir,
@@ -76,7 +77,9 @@ def environment_snapshot() -> dict:
     return env
 
 
-async def run_sweep(sdk: str, run_id: str) -> tuple[list[dict], dict]:
+async def run_sweep(
+    sdk: str, run_id: str, dataset_paths: list[Path] | None = None
+) -> tuple[list[dict], dict]:
     if sdk not in _ADAPTER_CLASSES:
         raise ValueError(f"unknown sdk {sdk!r}; expected one of {sorted(_ADAPTER_CLASSES)}")
     adapter_cls = _ADAPTER_CLASSES[sdk]
@@ -85,7 +88,9 @@ async def run_sweep(sdk: str, run_id: str) -> tuple[list[dict], dict]:
         raise RuntimeError(f"{sdk} adapter unavailable in this environment: {reason} — see DECISIONS.md D1")
 
     tasks: list[dict] = []
-    for path in DATASET_PATHS:
+    # Default stays basic+composition so `mcpbench benchmark` / `eval`
+    # without --dataset is unchanged; interactive.jsonl is opt-in (M3.1).
+    for path in dataset_paths or DATASET_PATHS:
         tasks.extend(row.model_dump() for row in load_dataset(path))
 
     model = build_model()  # once per sweep — agent identity pinned (SPEC §23)
@@ -119,7 +124,14 @@ async def run_sweep(sdk: str, run_id: str) -> tuple[list[dict], dict]:
         connect_start = time.perf_counter()
         try:
             await adapter.connect()
-            graph = build_agent(agent_tools, recording, model=model)
+            # M3.1 (SPEC.md §18): the per-task scripted user. Default
+            # (policy None) is "none" — no interaction, M1/M2 unchanged.
+            graph = build_agent(
+                agent_tools,
+                recording,
+                model=model,
+                user_simulator=ScriptedUserSimulator(row.get("user_simulator_policy")),
+            )
             result = await run_task(task, recording, graph)
             for call in result["tool_calls"]:
                 trace.record("mcp.tool_call", task_id=row["id"], tool=call.get("name"), arguments=call.get("arguments"))
@@ -143,8 +155,8 @@ async def run_sweep(sdk: str, run_id: str) -> tuple[list[dict], dict]:
     return records, snapshot
 
 
-def sweep_sync(sdk: str, run_id: str) -> None:
-    records, snapshot = asyncio.run(run_sweep(sdk, run_id))
+def sweep_sync(sdk: str, run_id: str, dataset_paths: list[Path] | None = None) -> None:
+    records, snapshot = asyncio.run(run_sweep(sdk, run_id, dataset_paths))
     environment = environment_snapshot()
     write_eval_result(run_id, sdk, records, environment)
     write_capabilities(run_id, {sdk: snapshot}, environment)

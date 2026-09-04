@@ -16,15 +16,35 @@ fault layer (mcp_sdk_bench.faults), driven by env vars read once at startup.
 One World instance per server process, seeded at startup; no disk persistence.
 WorldError and InjectedToolFault surface as an MCP tool error (isError)
 carrying the error message, via fastmcp.exceptions.ToolError.
+
+M3.1 (SPEC.md §18) adds elicitation on reserve_inventory (missing employee
+-> clarification) and deploy_service (production -> approval). The FastMCP
+client negotiates the modern 2026-07-28 protocol with this server, where
+imperative ``ctx.elicit()`` is deliberately unavailable (SEP-2577 removed
+the back-channel), so the protocol mechanics are the SEP-2322 guard pattern:
+the world's elicit callback raises _ElicitationPending when the current
+request leg carries no answer, the tool returns an
+``InputRequiredResult(input_requests={...: ElicitRequest(...)})``, the client
+fulfills it and RE-CALLS the tool with ``input_responses`` populated, and the
+re-entered callback resolves the answer from ``ctx.input_responses``. The
+world code is byte-identical to the official variant — only this callback
+and the InputRequiredResult translation are protocol-specific. Output schemas
+are pinned explicitly so the guard-leg return type never leaks into the wire
+contract. On handshake-era connections (< 2026-07-28) the guard return is
+rejected with FastMCP's era error (documented limitation; the benchmark's
+FastMCP client is always modern).
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+import inspect
+from collections.abc import Awaitable, Callable
 from enum import Enum
-from typing import Annotated, Any, TypeVar
+from functools import partial
+from typing import Annotated, Any, TypeVar, cast, overload
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
+from mcp import types
 from pydantic import BaseModel, Field
 
 from mcp_sdk_bench.faults import (
@@ -35,6 +55,8 @@ from mcp_sdk_bench.faults import (
 )
 from mcp_sdk_bench.world import (
     Deployment,
+    ElicitationUnavailable,
+    ElicitFn,
     InventoryItem,
     ProbeNestedItem,
     ProbeNestedObject,
@@ -42,11 +64,68 @@ from mcp_sdk_bench.world import (
     TicketStatus,
     World,
     WorldError,
+    elicitation_response,
     reset_world,
 )
 
 SERVER_NAME = "mcp-sdk-bench-fastmcp"
 SERVER_VERSION = "0.1.0"
+
+
+class _ElicitationPending(Exception):
+    """Leg-1 signal (SPEC.md §18, SEP-2322): the world's elicit policy fired
+    but this request leg carries no client answer yet. Caught by the tool
+    and translated into an InputRequiredResult; never a user-facing error."""
+
+    def __init__(self, key: str, payload: dict[str, Any]) -> None:
+        super().__init__(f"elicitation pending: {key}")
+        self.key = key
+        self.payload = payload
+
+
+def _elicit_key(payload: dict[str, Any]) -> str:
+    """Server-assigned input_requests key; the client echoes it on retry."""
+    return f"elicitation:{payload['kind']}"
+
+
+def _input_required(pending: _ElicitationPending) -> types.InputRequiredResult:
+    """Translate the world payload into a SEP-2322 form-mode elicitation
+    request embedded in an InputRequiredResult (2026-07-28 wire shape)."""
+    return types.InputRequiredResult(
+        input_requests={
+            pending.key: types.ElicitRequest(
+                params=types.ElicitRequestFormParams(
+                    message=pending.payload["question"],
+                    requested_schema=pending.payload["schema"],
+                )
+            )
+        }
+    )
+
+
+async def _elicit_via_ctx(ctx: Context, payload: dict[str, Any]) -> dict[str, Any]:
+    """FastMCP guard-pattern elicit callback (protocol mechanics, SPEC.md
+    §18): on the first leg there is no answer — signal _ElicitationPending
+    so the tool returns an InputRequiredResult; on the re-entered leg read
+    the client's ElicitResult from ctx.input_responses and normalize it into
+    the world seam's response dict.
+
+    A client WITHOUT the elicitation capability could not answer the
+    embedded ElicitRequest (its driver would fail the whole call with
+    "Elicitation not supported"); checked up front so the world falls back
+    to its legacy no-channel policy instead (honest degradation)."""
+    rc = ctx.request_context
+    capabilities = rc.session.client_capabilities if rc is not None else None
+    if capabilities is None or capabilities.elicitation is None:
+        raise ElicitationUnavailable("client did not advertise elicitation")
+    key = _elicit_key(payload)
+    responses = ctx.input_responses
+    if responses is None or key not in responses:
+        raise _ElicitationPending(key, payload)
+    result = responses[key]
+    if not isinstance(result, types.ElicitResult):
+        raise WorldError(f"unexpected input response for {key}: {type(result).__name__}")
+    return elicitation_response(result.action, result.content, payload)
 
 DEPLOYMENT_POLICY_URI = "company://policies/deployment"
 DEPLOYMENT_POLICY_DOC_ID = "dep-policy"
@@ -112,13 +191,38 @@ def create_server() -> FastMCP:
     fault_engine = FaultEngine(load_fault_config())
     server = FastMCP(SERVER_NAME, version=SERVER_VERSION)
 
+    @overload
     async def _run(
-        execute: Callable[[], _T], *, is_replay: Callable[[], bool] = lambda: False
+        execute: Callable[[], Awaitable[_T]],
+        *,
+        is_replay: Callable[[], bool] = ...,
+    ) -> _T: ...
+
+    @overload
+    async def _run(
+        execute: Callable[[], _T],
+        *,
+        is_replay: Callable[[], bool] = ...,
+    ) -> _T: ...
+
+    async def _run(
+        execute: Callable[[], _T | Awaitable[_T]],
+        *,
+        is_replay: Callable[[], bool] = lambda: False,
     ) -> _T:
         """Shared dispatch through the deterministic fault layer (SPEC.md
-        §21); identical semantics to the other two server variants."""
+        §21); identical semantics to the other two server variants. Execute
+        thunks may be async (M3.1 eliciting tools). _ElicitationPending is
+        NOT an error — it propagates to the tool body, which returns the
+        SEP-2322 InputRequiredResult for the leg."""
+        async def settled() -> _T:
+            value = execute()
+            if inspect.isawaitable(value):
+                return await cast("Awaitable[_T]", value)
+            return cast("_T", value)
+
         try:
-            return await run_tool_with_faults(fault_engine, execute, is_replay=is_replay)
+            return await run_tool_with_faults(fault_engine, settled, is_replay=is_replay)
         except (InjectedToolFault, WorldError) as err:
             raise ToolError(str(err)) from err
 
@@ -171,30 +275,56 @@ def create_server() -> FastMCP:
     async def get_inventory() -> InventoryOutput:
         return await _run(lambda: InventoryOutput(items=world.get_inventory()))
 
-    @server.tool(description="Reserve one unit of an inventory item for an employee.")
+    @server.tool(
+        description="Reserve one unit of an inventory item for an employee.",
+        # Pinned: the M3.1 guard leg returns InputRequiredResult, which must
+        # not leak into the wire outputSchema (SPEC.md §23 schema parity).
+        output_schema=ReserveInventoryOutput.model_json_schema(),
+    )
     async def reserve_inventory(
         item: Annotated[str, Field(description="Inventory item name, e.g. thinkpad-t14")],
+        ctx: Context,
         employee_id: Annotated[
-            str, Field(description="Employee id making the reservation, e.g. alice")
-        ],
-    ) -> ReserveInventoryOutput:
-        return await _run(
-            lambda: ReserveInventoryOutput(item=world.reserve_inventory(item, employee_id))
-        )
+            str | None,
+            Field(
+                description=(
+                    "Employee id making the reservation, e.g. alice; omit when unknown "
+                    "— the server will ask the user (elicitation)"
+                )
+            ),
+        ] = None,
+    ) -> ReserveInventoryOutput | types.InputRequiredResult:
+        async def execute() -> ReserveInventoryOutput:
+            elicit: ElicitFn = partial(_elicit_via_ctx, ctx)
+            inv = await world.reserve_inventory(item, employee_id, elicit=elicit)
+            return ReserveInventoryOutput(item=inv)
 
-    @server.tool(description="Deploy a service at a target version to an environment.")
+        try:
+            return await _run(execute)
+        except _ElicitationPending as pending:
+            return _input_required(pending)
+
+    @server.tool(
+        description="Deploy a service at a target version to an environment.",
+        output_schema=DeploymentOutput.model_json_schema(),
+    )
     async def deploy_service(
         service: Annotated[str, Field(description="Service name, e.g. checkout")],
         target_version: Annotated[str, Field(description="Version to deploy, e.g. 1.8.3")],
         environment: Annotated[
             str, Field(description="Target environment, e.g. staging or production")
         ],
-    ) -> DeploymentOutput:
-        return await _run(
-            lambda: DeploymentOutput(
-                deployment=world.deploy_service(service, target_version, environment)
-            )
-        )
+        ctx: Context,
+    ) -> DeploymentOutput | types.InputRequiredResult:
+        async def execute() -> DeploymentOutput:
+            elicit: ElicitFn = partial(_elicit_via_ctx, ctx)
+            dep = await world.deploy_service(service, target_version, environment, elicit=elicit)
+            return DeploymentOutput(deployment=dep)
+
+        try:
+            return await _run(execute)
+        except _ElicitationPending as pending:
+            return _input_required(pending)
 
     @server.tool(
         description=(

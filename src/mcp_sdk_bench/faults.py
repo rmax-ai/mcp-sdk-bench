@@ -36,10 +36,11 @@ the same FaultEngine, so identical seeds give identical sequences.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import random
-from collections.abc import Callable, Mapping
-from typing import Literal
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Literal, cast, overload
 
 from pydantic import BaseModel, Field
 
@@ -140,9 +141,36 @@ class FaultEngine:
             await asyncio.sleep(self.config.latency_ms / 1000)
 
 
+async def settle[T](value: T | Awaitable[T]) -> T:
+    """Await `value` when the execute thunk is async (M3.1, SPEC.md §18:
+    eliciting tools suspend mid-transaction awaiting the user's answer);
+    pass plain values through unchanged."""
+    if inspect.isawaitable(value):
+        return await cast(Awaitable[T], value)
+    return value
+
+
+@overload
+async def run_tool_with_faults[T](
+    engine: FaultEngine,
+    execute: Callable[[], Awaitable[T]],
+    *,
+    is_replay: Callable[[], bool] = ...,
+) -> T: ...
+
+
+@overload
 async def run_tool_with_faults[T](
     engine: FaultEngine,
     execute: Callable[[], T],
+    *,
+    is_replay: Callable[[], bool] = ...,
+) -> T: ...
+
+
+async def run_tool_with_faults[T](
+    engine: FaultEngine,
+    execute: Callable[[], T | Awaitable[T]],
     *,
     is_replay: Callable[[], bool] = lambda: False,
 ) -> T:
@@ -157,7 +185,9 @@ async def run_tool_with_faults[T](
     2. FAIL_PHASE=before + should_fail_call() -> raise InjectedToolFault
        BEFORE execution (no side effect).
     3. apply_latency().
-    4. execute() — the world transaction.
+    4. execute() — the world transaction. May be async (M3.1 elicitation:
+       the transaction pauses for a user round-trip); faults never fire
+       while the transaction is suspended awaiting input.
     5. FAIL_PHASE=after + should_fail_call() -> raise InjectedToolFault AFTER
        execution (side effect applied, failure reported — the SPEC.md §21
        idempotency probe).
@@ -165,11 +195,11 @@ async def run_tool_with_faults[T](
        transaction executed, then failed at the task level).
     """
     if is_replay():
-        return execute()  # replay: no transaction, no fault draws
+        return await settle(execute())  # replay: no transaction, no fault draws
     if engine.config.fail_phase == "before" and engine.should_fail_call():
         raise InjectedToolFault(INJECTED_FAULT)
     await engine.apply_latency()
-    result = execute()
+    result = await settle(execute())
     if engine.config.fail_phase == "after" and engine.should_fail_call():
         raise InjectedToolFault(INJECTED_FAULT_AFTER)
     if engine.task_failure():

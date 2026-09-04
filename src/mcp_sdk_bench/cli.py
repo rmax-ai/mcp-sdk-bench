@@ -157,35 +157,61 @@ def interoperability() -> None:
         raise typer.Exit(code=1)
 
 
+def _resolve_datasets(names: list[str] | None) -> list[Path] | None:
+    """Resolve --dataset values to JSONL paths (M3.1). A bare name resolves
+    under datasets/ (suffix optional); a path is used as given. None keeps
+    the sweep default (basic + composition), unchanged from M1."""
+    if not names:
+        return None
+    paths: list[Path] = []
+    for name in names:
+        candidate = Path(name)
+        if not candidate.is_absolute() and not candidate.exists():
+            candidate = REPO_ROOT / "datasets" / name
+        if candidate.suffix != ".jsonl":
+            candidate = candidate.with_suffix(".jsonl")
+        if not candidate.exists():
+            typer.echo(f"mcpbench: unknown dataset {name!r} (looked for {candidate})")
+            raise typer.Exit(code=2)
+        paths.append(candidate)
+    return paths
+
+
 @app.command()
 def eval(
-    sdk: str = typer.Option("all", "--sdk", "-s", help="Limit eval to one SDK: fastmcp | official | adk"),
+    sdk: Annotated[list[str] | None, typer.Option("--sdk", "-s", help="Repeatable: official | fastmcp | adk (default: all available).")] = None,
+    dataset: Annotated[list[str] | None, typer.Option("--dataset", "-d", help="Repeatable dataset (name under datasets/ or path; default: basic + composition). M3.1: interactive.")] = None,
     run_id: str = typer.Option(None, "--run-id", help="Run id (default: new)"),
 ) -> None:
-    """Run the agent evaluation suite (SPEC.md §9-11)."""
+    """Run the agent evaluation suite (SPEC.md §9-11; §18 interactive)."""
 
     rid = run_id or new_run_id()
     available = _available_adapters()
-    if sdk == "all":
+    dataset_paths = _resolve_datasets(dataset)
+    requested = sdk or ["all"]
+    unknown = [s for s in requested if s not in ("official", "fastmcp", "adk", "all")]
+    if unknown:
+        typer.echo(f"mcpbench: unknown sdk(s) {unknown} (expected official | fastmcp | adk)")
+        raise typer.Exit(code=2)
+    if "all" in requested:
         targets = [name for name in ("official", "fastmcp") if name in available]
         if "adk" in available:
             targets.append("adk")
-        elif sdk == "all":
+        else:
             typer.echo("mcpbench: adk adapter not importable in this env — adk runs via `mcpbench benchmark` (envs/adk).")
     else:
-        if sdk not in ("official", "fastmcp", "adk"):
-            typer.echo(f"mcpbench: unknown sdk {sdk!r} (expected official | fastmcp | adk)")
-            raise typer.Exit(code=2)
-        if sdk not in available:
-            typer.echo(
-                f"mcpbench: {sdk} adapter unavailable in this environment — run the adk variant via `mcpbench benchmark` (envs/adk)."
-            )
-            raise typer.Exit(code=2)
-        targets = [sdk]
+        targets = []
+        for name in requested:
+            if name not in available:
+                typer.echo(
+                    f"mcpbench: {name} adapter unavailable in this environment — run the adk variant via `mcpbench benchmark` (envs/adk)."
+                )
+                raise typer.Exit(code=2)
+            targets.append(name)
 
     for name in targets:
         typer.echo(f"mcpbench: eval sdk={name} run_id={rid}")
-        sweep_sync(name, rid)
+        sweep_sync(name, rid, dataset_paths)
 
 
 # ---- failures (M2.3b, SPEC.md §21) ----

@@ -10,12 +10,27 @@ the SPEC.md §8 SCHEMA conformance category. M2.3a adds create_ticket (SPEC.md
 §21 idempotent creation) and the shared deterministic fault layer
 (mcp_sdk_bench.faults), driven by env vars read once at startup. One World
 instance per server process, seeded at startup; no disk persistence.
+
+M3.1 (SPEC.md §18) adds protocol elicitation on reserve_inventory (missing
+employee -> clarification) and deploy_service (production -> approval). The
+protocol mechanics here are exactly one seam: the world methods receive an
+`elicit` callback that sends ``elicitation/create`` (form mode) via
+``ServerSession.elicit_form`` and awaits the client's ElicitResult in-band,
+with a timeout. Elicitation is a CLIENT-advertised capability in MCP
+(ElicitationCapability lives on ClientCapabilities, not ServerCapabilities),
+so there is nothing to declare server-side; the benchmark's official client
+advertises it by registering an elicitation callback (see
+adapters/official.py). reserve_inventory's employee_id becomes optional in
+the input schema so the clarification flow is reachable from the wire
+(identical schema change in all three variants — SPEC.md §23).
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
-from collections.abc import Callable
-from typing import Any, Literal
+from collections.abc import Awaitable, Callable
+from typing import Any, Literal, cast
 
 from mcp import types
 from mcp.server.lowlevel import Server
@@ -32,6 +47,8 @@ from mcp_sdk_bench.faults import (
 from mcp_sdk_bench.world import (
     PROBE_SCHEMA_ENUM_VALUES,
     Deployment,
+    ElicitationUnavailable,
+    ElicitFn,
     InventoryItem,
     ProbeNestedItem,
     ProbeNestedObject,
@@ -39,11 +56,16 @@ from mcp_sdk_bench.world import (
     TicketStatus,
     World,
     WorldError,
+    elicitation_response,
     reset_world,
 )
 
 SERVER_NAME = "mcp-sdk-bench-official"
 SERVER_VERSION = "0.1.0"
+
+#: Max wait for the client's elicitation response before the call fails loud
+#: (WorldError) instead of hanging the tool handler.
+ELICIT_TIMEOUT_S = 30.0
 
 DEPLOYMENT_POLICY_URI = "company://policies/deployment"
 DEPLOYMENT_POLICY_DOC_ID = "dep-policy"
@@ -76,7 +98,13 @@ class GetInventoryInput(BaseModel):
 
 class ReserveInventoryInput(BaseModel):
     item: str = Field(description="Inventory item name, e.g. thinkpad-t14")
-    employee_id: str = Field(description="Employee id making the reservation, e.g. alice")
+    employee_id: str | None = Field(
+        default=None,
+        description=(
+            "Employee id making the reservation, e.g. alice; omit when unknown "
+            "— the server will ask the user (elicitation)"
+        ),
+    )
 
 
 class DeployServiceInput(BaseModel):
@@ -274,8 +302,11 @@ def create_server() -> Server[Any]:
         )
 
     def _validated_call(
-        name: str, arguments: dict[str, Any] | None
-    ) -> tuple[Callable[[], types.CallToolResult], Callable[[], bool]]:
+        name: str, arguments: dict[str, Any] | None, elicit: ElicitFn
+    ) -> tuple[
+        Callable[[], types.CallToolResult | Awaitable[types.CallToolResult]],
+        Callable[[], bool],
+    ]:
         """Validate arguments and return (execute, is_replay) thunks.
 
         Validation runs BEFORE any fault draw so protocol-level errors
@@ -283,6 +314,11 @@ def create_server() -> Server[Any]:
         `is_replay` reports whether the call is an idempotent replay
         (create_ticket with an already-used key — SPEC.md §21); replays
         bypass the fault layer because they execute no transaction.
+
+        M3.1 (SPEC.md §18): `elicit` is the per-request elicitation callback
+        (protocol mechanics owned here; policy owned by the world). Only
+        reserve_inventory / deploy_service pass it on, and only their thunks
+        are async — the fault layer awaits them (run_tool_with_faults).
         """
         if name == PROBE_SCHEMA_TOOL:
             try:
@@ -343,15 +379,17 @@ def create_server() -> Server[Any]:
             case GetInventoryInput():
                 return lambda: _ok(InventoryOutput(items=world.get_inventory())), lambda: False
             case ReserveInventoryInput(item=item, employee_id=employee_id):
-                return (
-                    lambda: _ok(ReserveInventoryOutput(item=world.reserve_inventory(item, employee_id))),
-                    lambda: False,
-                )
+                async def execute_reserve() -> types.CallToolResult:
+                    inv = await world.reserve_inventory(item, employee_id, elicit=elicit)
+                    return _ok(ReserveInventoryOutput(item=inv))
+
+                return execute_reserve, lambda: False
             case DeployServiceInput(service=service, target_version=version, environment=env):
-                return (
-                    lambda: _ok(DeploymentOutput(deployment=world.deploy_service(service, version, env))),
-                    lambda: False,
-                )
+                async def execute_deploy() -> types.CallToolResult:
+                    dep = await world.deploy_service(service, version, env, elicit=elicit)
+                    return _ok(DeploymentOutput(deployment=dep))
+
+                return execute_deploy, lambda: False
         raise MCPError(INVALID_PARAMS, f"unknown tool {name}")  # pragma: no cover
 
     def _injected_fault(err: InjectedToolFault) -> types.CallToolResult:
@@ -363,9 +401,42 @@ def create_server() -> Server[Any]:
     async def on_call_tool(
         _ctx: ServerRequestContext[Any], params: types.CallToolRequestParams
     ) -> types.CallToolResult:
-        execute, is_replay = _validated_call(params.name, params.arguments)
+        async def elicit(payload: dict[str, Any]) -> dict[str, Any]:
+            """M3.1 protocol mechanics (SPEC.md §18): send the world's
+            elicitation request as ``elicitation/create`` (form mode) on this
+            request's session and await the client's answer in-band.
+
+            A client WITHOUT the elicitation capability answers
+            INVALID_REQUEST "Elicitation not supported" — mapped to
+            ElicitationUnavailable so the world falls back to its legacy
+            no-channel policy (honest degradation, never a faked answer).
+            Any other failure (a stalled client hitting the timeout, a real
+            protocol error) fails loud as WorldError rather than hanging."""
+            try:
+                result = await asyncio.wait_for(
+                    _ctx.session.elicit_form(payload["question"], payload["schema"]),
+                    timeout=ELICIT_TIMEOUT_S,
+                )
+            except MCPError as err:
+                if "not supported" in str(err).lower():
+                    raise ElicitationUnavailable(str(err)) from err
+                raise WorldError(f"elicitation failed: {err}") from err
+            except TimeoutError as err:
+                raise WorldError(f"elicitation timed out after {ELICIT_TIMEOUT_S}s") from err
+            return elicitation_response(result.action, result.content, payload)
+
+        execute, is_replay = _validated_call(params.name, params.arguments, elicit)
+
+        async def settled() -> types.CallToolResult:
+            # M3.1: eliciting tools are async thunks; settle explicitly so
+            # the fault layer sees one uniform awaitable.
+            value = execute()
+            if inspect.isawaitable(value):
+                return await cast("Awaitable[types.CallToolResult]", value)
+            return cast("types.CallToolResult", value)
+
         try:
-            return await run_tool_with_faults(fault_engine, execute, is_replay=is_replay)
+            return await run_tool_with_faults(fault_engine, settled, is_replay=is_replay)
         except InjectedToolFault as err:
             return _injected_fault(err)
         except WorldError as err:

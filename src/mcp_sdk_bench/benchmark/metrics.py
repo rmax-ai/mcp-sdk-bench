@@ -1,9 +1,9 @@
 """Per-task metric assembly (SPEC.md §10).
 
 Joins the runner result with the deterministic grader verdict into the full
-metric record. Fields that M2–M5 experiments fill (error_recovery_success,
-protocol_errors, user_interactions) are emitted as null — honest absence,
-not a fabricated zero.
+metric record. Fields no experiment measures yet (error_recovery_success,
+protocol_errors) are emitted as null — honest absence, not a fabricated
+zero. user_interactions is real since M3.1 (SPEC.md §18).
 """
 from __future__ import annotations
 
@@ -66,14 +66,21 @@ def assemble(task: dict, run_result: dict, verdict: dict) -> dict[str, Any]:
     for field in _VERDICT_FIELDS:
         record[field] = verdict.get(field)
     record["LLM_turn_count"] = (run_result.get("round_trips") or 0) + 1
-    record["MCP_round_trips"] = run_result.get("round_trips")
+    # M3.1 (SPEC.md §18): MCP round trips include the elicitation
+    # pause/resume legs; pre-M3.1 run records lack the field and fall back
+    # to the LLM-driven count (identical when no elicitation occurred).
+    record["MCP_round_trips"] = run_result.get("mcp_round_trips")
+    if record["MCP_round_trips"] is None:
+        record["MCP_round_trips"] = run_result.get("round_trips")
     record["error"] = run_result.get("error") or verdict.get("error")
     record["final_answer"] = run_result.get("final_answer")
     record["tool_calls"] = run_result.get("tool_calls", [])
-    # M2+: failure recovery, protocol errors, user interactions.
+    # M2+: failure recovery and protocol errors remain unmeasured.
     record["error_recovery_success"] = None
     record["protocol_errors"] = None
-    record["user_interactions"] = None
+    # M3.1: real user-interaction count (scripted simulator answers).
+    # Records from pre-M3.1 runners lack the field -> None, honest absence.
+    record["user_interactions"] = run_result.get("user_interactions")
     # M2.3b reliability counters: taken from the run result when the
     # reliability experiment populated them, else None (honest absence).
     for field in _RELIABILITY_FIELDS:
@@ -106,6 +113,8 @@ def aggregate(records: list[dict]) -> dict[str, Any]:
         "mean_model_latency_ms": mean("model_latency_ms"),
         "mean_input_tokens": mean("input_tokens"),
         "mean_output_tokens": mean("output_tokens"),
+        # M3.1 (SPEC.md §18): scripted-user interactions per task.
+        "mean_user_interactions": mean("user_interactions"),
         # M2.3b reliability aggregates (None when unobserved — e.g. M1 runs).
         # `recovery` is bool; bools aggregate as 0/1 via isinstance(int).
         "mean_retry_count": mean("retry_count"),

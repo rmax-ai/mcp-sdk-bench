@@ -56,7 +56,7 @@ class WorldAdapter(MCPAdapter):
                     }
                 )
             if name == "reserve_inventory":
-                item = self.world.reserve_inventory(
+                item = await self.world.reserve_inventory(
                     arguments["item"], arguments["employee_id"]
                 )
                 return ToolResult(structured_content={"item": item.model_dump()})

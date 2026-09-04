@@ -39,6 +39,7 @@ from mcp_sdk_bench.faults import (
     InjectedToolFault,
     load_fault_config,
     run_tool_with_faults,
+    settle,
 )
 from mcp_sdk_bench.world import Ticket, TicketStatus, World, WorldError, seed_world
 
@@ -132,7 +133,7 @@ class InProcessWorldAdapter(MCPAdapter):
         try:
             if self.engine is not None:
                 return await run_tool_with_faults(self.engine, execute, is_replay=is_replay)
-            return execute()
+            return await settle(execute())
         except (InjectedToolFault, WorldError) as err:
             return ToolResult(is_error=True, text=str(err))
 
@@ -180,18 +181,18 @@ class InProcessWorldAdapter(MCPAdapter):
                 lambda: False,
             )
         if name == "deploy_service":
-            return (
-                lambda: ToolResult(
-                    structured_content={
-                        "deployment": world.deploy_service(
-                            arguments["service"],
-                            arguments["target_version"],
-                            arguments["environment"],
-                        ).model_dump(mode="json")
-                    }
-                ),
-                lambda: False,
-            )
+
+            async def deploy() -> ToolResult:
+                deployment = await world.deploy_service(
+                    arguments["service"],
+                    arguments["target_version"],
+                    arguments["environment"],
+                )
+                return ToolResult(
+                    structured_content={"deployment": deployment.model_dump(mode="json")}
+                )
+
+            return deploy, lambda: False
         raise WorldError(f"unknown tool {name}")
 
     async def read_resource(self, uri: str) -> str:

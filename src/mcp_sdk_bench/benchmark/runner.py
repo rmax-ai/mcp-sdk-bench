@@ -59,17 +59,26 @@ class AccessRecordingAdapter(MCPAdapter):
 
     async def call_tool(self, name: str, arguments: dict) -> ToolResult:
         result = await self._inner.call_tool(name, arguments)
-        self.call_log.append(
-            {
-                "name": name,
-                "arguments": dict(arguments),
-                "args_hash": args_hash(arguments),
-                "is_error": result.is_error,
-                "error_text": result.text if result.is_error else None,
-                "structured_content": result.structured_content if not result.is_error else None,
-            }
-        )
+        entry = {
+            "name": name,
+            "arguments": dict(arguments),
+            "args_hash": args_hash(arguments),
+            "is_error": result.is_error,
+            "error_text": result.text if result.is_error else None,
+            "structured_content": result.structured_content if not result.is_error else None,
+        }
+        # M3.1 (SPEC.md §18): a paused leg is recorded with its elicitation
+        # request; the verbatim resume leg is recorded as a normal call.
+        if result.elicitation_request is not None:
+            entry["elicitation_request"] = result.elicitation_request
+            entry["structured_content"] = None
+        self.call_log.append(entry)
         return result
+
+    async def respond_to_elicitation(self, payload: dict) -> None:
+        # M3.1: pass through to the wrapped adapter so the agent loop's
+        # pause/resume works identically through the recording proxy.
+        await self._inner.respond_to_elicitation(payload)
 
     async def read_resource(self, uri: str) -> str:
         self.recorded_access.append({"name": "read_resource", "arguments": {"uri": uri}})
@@ -131,6 +140,8 @@ async def run_task(task: dict, adapter: MCPAdapter, agent_graph: Any) -> dict:
                 "iterations": 0,
                 "tool_calls": [],
                 "mcp_latency_ms": 0.0,
+                "user_interactions": 0,
+                "elicitation_round_trips": 0,
             },
             config={"recursion_limit": RECURSION_LIMIT},
         )
@@ -151,12 +162,22 @@ async def run_task(task: dict, adapter: MCPAdapter, agent_graph: Any) -> dict:
     # empty when the adapter is not an AccessRecordingAdapter.
     call_log = getattr(adapter, "call_log", None)
 
+    # M3.1 (SPEC.md §18): user-simulator interactions and the elicitation
+    # pause/resume legs. MCP round trips count the LLM-driven tool loops
+    # PLUS each elicitation leg (the resumed call crosses the wire again).
+    user_interactions = int(state.get("user_interactions", 0))
+    elicitation_round_trips = int(state.get("elicitation_round_trips", 0))
+    round_trips = _round_trips(state.get("messages", []))
+
     return {
         "task_id": task["id"],
         "sdk": task["sdk"],
         "tool_calls": tool_calls,
         "tool_call_log": list(call_log) if call_log is not None else [],
-        "round_trips": _round_trips(state.get("messages", [])),
+        "round_trips": round_trips,
+        "mcp_round_trips": round_trips + elicitation_round_trips,
+        "user_interactions": user_interactions,
+        "elicitation_round_trips": elicitation_round_trips,
         "total_latency_ms": total_latency_ms,
         "mcp_latency_ms": mcp_latency_ms,
         "model_latency_ms": total_latency_ms - mcp_latency_ms,

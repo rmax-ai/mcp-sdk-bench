@@ -34,6 +34,23 @@ Two ADK 2.8 findings baked in below:
   text is always included, and the result is ``isError=True`` — never a
   crash.
 
+M3.1 (SPEC.md §18) capability classification: NO protocol elicitation, and
+none is stubbed. The tools below are ADK ``FunctionTool`` definitions served
+through mcp 1.x FastMCP — there is no request-context injection point at
+which a FunctionTool could suspend on an MCP ``elicitation/create`` exchange,
+so ``reserve_inventory`` keeps raising WorldError on a missing employee and
+``deploy_service`` keeps the legacy production guard. (Verified in envs/adk:
+ADK 2.8.0's ``McpToolset`` accepts an ``elicitation_callback`` on the CLIENT
+side, but wiring it would change the harness for one candidate only —
+SPEC.md §23 one-independent-variable — and the server side still cannot
+reach it from a FunctionTool.) Framework-native equivalents exist outside
+MCP: ``FunctionTool(require_confirmation=...)`` (HITL confirmation inside
+the ADK runtime) and ``LongRunningFunctionTool`` (async long-running tools).
+They are documented in docs/capability-matrix.md and deliberately NOT wired
+into this variant. ``employee_id`` becomes optional in the schema (identical
+change in all three variants) so the missing-employee flow reaches the
+world's honest WorldError instead of a schema-validation error.
+
 This module runs only in the ADK env. From the repo root:
 
     PYTHONPATH=src uv run --project envs/adk python -m mcp_sdk_bench.servers.adk
@@ -44,9 +61,10 @@ Smoke self-check (spawns the server over stdio, lists tools, exits 0):
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+import inspect
+from collections.abc import Awaitable, Callable
 from enum import Enum
-from typing import Annotated, Any, TypeVar
+from typing import Annotated, Any, TypeVar, cast, overload
 
 from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
@@ -144,13 +162,36 @@ def build_agent(world: World) -> LlmAgent:
     """
     fault_engine = FaultEngine(load_fault_config())
 
+    @overload
     async def _run(
-        execute: Callable[[], _T], *, is_replay: Callable[[], bool] = lambda: False
+        execute: Callable[[], Awaitable[_T]],
+        *,
+        is_replay: Callable[[], bool] = ...,
+    ) -> _T: ...
+
+    @overload
+    async def _run(
+        execute: Callable[[], _T],
+        *,
+        is_replay: Callable[[], bool] = ...,
+    ) -> _T: ...
+
+    async def _run(
+        execute: Callable[[], _T | Awaitable[_T]],
+        *,
+        is_replay: Callable[[], bool] = lambda: False,
     ) -> _T:
         """Shared dispatch through the deterministic fault layer (SPEC.md
-        §21); identical semantics to the other two server variants."""
+        §21); identical semantics to the other two server variants. Execute
+        thunks may be async (M3.1)."""
+        async def settled() -> _T:
+            value = execute()
+            if inspect.isawaitable(value):
+                return await cast("Awaitable[_T]", value)
+            return cast("_T", value)
+
         try:
-            return await run_tool_with_faults(fault_engine, execute, is_replay=is_replay)
+            return await run_tool_with_faults(fault_engine, settled, is_replay=is_replay)
         except (InjectedToolFault, WorldError) as err:
             raise ToolError(str(err)) from err
 
@@ -206,13 +247,24 @@ def build_agent(world: World) -> LlmAgent:
     async def reserve_inventory(
         item: Annotated[str, Field(description="Inventory item name, e.g. thinkpad-t14")],
         employee_id: Annotated[
-            str, Field(description="Employee id making the reservation, e.g. alice")
-        ],
+            str | None,
+            Field(
+                description=(
+                    "Employee id making the reservation, e.g. alice; omit when unknown "
+                    "— the server will ask the user (elicitation)"
+                )
+            ),
+        ] = None,
     ) -> ReserveInventoryOutput:
         """Reserve one unit of an inventory item for an employee."""
-        return await _run(
-            lambda: ReserveInventoryOutput(item=world.reserve_inventory(item, employee_id))
-        )
+
+        # M3.1: no elicit callback — the ADK variant has no protocol
+        # elicitation surface, so a missing employee raises the world's
+        # honest WorldError (see module docstring).
+        async def execute() -> ReserveInventoryOutput:
+            return ReserveInventoryOutput(item=await world.reserve_inventory(item, employee_id))
+
+        return await _run(execute)
 
     async def deploy_service(
         service: Annotated[str, Field(description="Service name, e.g. checkout")],
@@ -222,11 +274,14 @@ def build_agent(world: World) -> LlmAgent:
         ],
     ) -> DeploymentOutput:
         """Deploy a service at a target version to an environment."""
-        return await _run(
-            lambda: DeploymentOutput(
-                deployment=world.deploy_service(service, target_version, environment)
+
+        # M3.1: no elicit callback — the legacy production guard applies.
+        async def execute() -> DeploymentOutput:
+            return DeploymentOutput(
+                deployment=await world.deploy_service(service, target_version, environment)
             )
-        )
+
+        return await _run(execute)
 
     async def probe_schema(
         string_field: str,

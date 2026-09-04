@@ -4,11 +4,24 @@ Drives ``python -m mcp_sdk_bench.servers.official`` as a stdio subprocess via
 mcp.client.stdio.stdio_client + ClientSession (probed against the installed
 mcp 2.1.1: ClientSession.list_tools/call_tool/read_resource/get_prompt,
 CallToolResult fields meta/content/structured_content/is_error).
+
+M3.1 (SPEC.md §18): the ClientSession is created with an elicitation
+callback, which advertises ElicitationCapability (form mode) at initialize —
+elicitation is a client-advertised capability in MCP. The callback runs
+inside the session receive loop while call_tool is in flight; the
+ElicitationBridge pauses the adapter call (ToolResult.elicitation_request)
+until respond_to_elicitation delivers the user's payload, then the callback
+returns the ElicitResult and the paused wire call completes. The resume
+surfaces on the next call_tool for the same (name, arguments).
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import get_default_environment, stdio_client
@@ -16,11 +29,14 @@ from mcp.shared.exceptions import MCPError
 
 from mcp_sdk_bench.adapters.base import (
     Discovery,
+    ElicitationBridge,
     MCPAdapter,
     PromptSpec,
     ResourceSpec,
     ToolResult,
     ToolSpec,
+    elicitation_wire_content,
+    infer_elicitation_kind,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -32,6 +48,15 @@ def _text_of(content: list) -> str:
     )
 
 
+@dataclass
+class _PausedCall:
+    """An in-flight wire call paused on a server elicitation (M3.1)."""
+
+    task: asyncio.Task[ToolResult]
+    name: str
+    arguments: dict[str, Any]
+
+
 class OfficialAdapter(MCPAdapter):
     def __init__(self, env: dict[str, str] | None = None) -> None:
         #: Extra env vars merged over the SDK default subprocess environment
@@ -41,6 +66,9 @@ class OfficialAdapter(MCPAdapter):
         self._stdio_cm = None
         self._session_cm = None
         self._session: ClientSession | None = None
+        #: M3.1 elicitation plumbing (SPEC.md §18).
+        self._elicit_bridge = ElicitationBridge()
+        self._paused: _PausedCall | None = None
 
     async def connect(self) -> Discovery:
         params = StdioServerParameters(
@@ -51,7 +79,12 @@ class OfficialAdapter(MCPAdapter):
         )
         self._stdio_cm = stdio_client(params)
         read_stream, write_stream = await self._stdio_cm.__aenter__()
-        self._session_cm = ClientSession(read_stream, write_stream)
+        # Registering the elicitation callback advertises
+        # ElicitationCapability (form mode) at initialize (mcp 2.1.1:
+        # ClientSession advertises it iff a non-default callback is set).
+        self._session_cm = ClientSession(
+            read_stream, write_stream, elicitation_callback=self._on_elicitation
+        )
         self._session = await self._session_cm.__aenter__()
         await self._session.initialize()
         return await self._discover()
@@ -92,7 +125,38 @@ class OfficialAdapter(MCPAdapter):
             ],
         )
 
-    async def call_tool(self, name: str, arguments: dict) -> ToolResult:
+    async def _on_elicitation(
+        self,
+        context: Any,
+        params: types.ElicitRequestParams,
+    ) -> types.ElicitResult | types.ErrorData:
+        """Client-side elicitation callback (M3.1, SPEC.md §18). Runs inside
+        the session receive loop during an in-flight call_tool: normalize the
+        request, pause the adapter call, and block until
+        respond_to_elicitation delivers the user's payload."""
+        if not isinstance(params, types.ElicitRequestFormParams):
+            # The world only mints form-mode payloads; URL mode is out of
+            # scope for M3.1 — decline honestly rather than fabricate.
+            return types.ErrorData(
+                code=types.INVALID_REQUEST,
+                message="mcp-sdk-bench harness supports form-mode elicitation only",
+            )
+        schema = dict(params.requested_schema)
+        request = {
+            "kind": infer_elicitation_kind(schema),
+            "question": params.message,
+            "schema": schema,
+        }
+        self._elicit_bridge.post_request(request)
+        payload = await self._elicit_bridge.wait_answer()
+        action, content = elicitation_wire_content(request, payload)
+        return types.ElicitResult(action=action, content=content)
+
+    async def respond_to_elicitation(self, payload: dict) -> None:
+        self._elicit_bridge.deliver(payload)
+
+    async def _call(self, name: str, arguments: dict) -> ToolResult:
+        """One wire-level tools/call, exceptions mapped to ToolResult."""
         assert self._session is not None
         try:
             result = await self._session.call_tool(name, arguments)
@@ -108,6 +172,38 @@ class OfficialAdapter(MCPAdapter):
             structured_content=result.structured_content,
             text=_text_of(result.content),
         )
+
+    async def call_tool(self, name: str, arguments: dict) -> ToolResult:
+        assert self._session is not None
+        if self._paused is not None:
+            # Resume path: the paused wire call completed once
+            # respond_to_elicitation delivered the answer.
+            paused = self._paused
+            self._paused = None
+            if name != paused.name or dict(arguments) != paused.arguments:
+                raise RuntimeError(
+                    "elicitation resume must re-issue the paused call verbatim "
+                    f"(paused on {paused.name}, got {name})"
+                )
+            return await paused.task
+        call_task = asyncio.create_task(self._call(name, arguments))
+        elicitation_waiter = asyncio.create_task(self._elicit_bridge.wait_request())
+        done, _ = await asyncio.wait(
+            {call_task, elicitation_waiter}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if elicitation_waiter in done and not call_task.done():
+            # The server paused the call for user input (SPEC.md §18).
+            request = elicitation_waiter.result()
+            self._paused = _PausedCall(task=call_task, name=name, arguments=dict(arguments))
+            return ToolResult(
+                is_error=False,
+                text=f"elicitation requested ({request['kind']}): {request['question']}",
+                elicitation_request=request,
+            )
+        elicitation_waiter.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await elicitation_waiter
+        return await call_task
 
     async def read_resource(self, uri: str) -> str:
         assert self._session is not None

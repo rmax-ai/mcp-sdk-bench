@@ -2,9 +2,14 @@
 from mcp_sdk_bench.world.fixtures import seed_world
 from mcp_sdk_bench.world.reset import reset_world
 from mcp_sdk_bench.world.state import (
+    DEPLOYMENT_DECLINED,
+    ELICIT_APPROVAL,
+    ELICIT_CLARIFICATION,
     PROBE_SCHEMA_ENUM_VALUES,
     Deployment,
     Document,
+    ElicitationUnavailable,
+    ElicitFn,
     Employee,
     InventoryItem,
     OpRecord,
@@ -15,12 +20,21 @@ from mcp_sdk_bench.world.state import (
     TicketStatus,
     World,
     WorldError,
+    approval_payload,
+    clarification_payload,
+    elicitation_response,
+    requested_field,
 )
 
 __all__ = [
+    "DEPLOYMENT_DECLINED",
+    "ELICIT_APPROVAL",
+    "ELICIT_CLARIFICATION",
     "PROBE_SCHEMA_ENUM_VALUES",
     "Deployment",
     "Document",
+    "ElicitFn",
+    "ElicitationUnavailable",
     "Employee",
     "InventoryItem",
     "OpRecord",
@@ -31,6 +45,10 @@ __all__ = [
     "TicketStatus",
     "World",
     "WorldError",
+    "approval_payload",
+    "clarification_payload",
+    "elicitation_response",
+    "requested_field",
     "reset_world",
     "seed_world",
 ]

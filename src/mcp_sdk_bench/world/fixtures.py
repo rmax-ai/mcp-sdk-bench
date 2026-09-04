@@ -24,6 +24,10 @@ def seed_world() -> World:
             "alice": Employee(id="alice", name="Alice", team="payments", title="Staff Engineer"),
             "bob": Employee(id="bob", name="Bob", team="risk", title="Analyst"),
             "carol": Employee(id="carol", name="Carol", team="platform", title="SRE"),
+            # M3.1 (SPEC.md §18): the clarified reservation target of the
+            # interactive dataset (g-03 "reserve a laptop for the new
+            # engineer" -> user simulator answers "alina").
+            "alina": Employee(id="alina", name="Alina", team="platform", title="New Engineer"),
         },
         tickets={
             "PAY-123": Ticket(

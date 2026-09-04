@@ -29,6 +29,15 @@ class BenchmarkTask(BaseModel):
     forbidden_contains: list[str] = []
     expected_trajectory: list[str] | None
     allowed_extra_tools: list[str]
+    #: M3.1 (SPEC.md §18): scripted user policy for interactive tasks —
+    #: none | auto-approve | auto-decline | clarify-with:<value>.
+    #: Absent/None behaves as "none" (no interaction), so every M1/M2 row
+    #: is unchanged.
+    user_simulator_policy: str | None = None
+    #: M3.1: minimum number of scripted-user interactions (clarify-hook
+    #: injections + elicitation responses) the run must record. Absent/None
+    #: means no interaction requirement.
+    min_user_interactions: int | None = None
 
 
 def load_dataset(path: Path) -> list[BenchmarkTask]:

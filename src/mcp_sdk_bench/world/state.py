@@ -9,6 +9,7 @@ Rules:
 """
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import Any
 
@@ -84,6 +85,93 @@ class OpRecord(BaseModel):
 
 class WorldError(Exception):
     """Domain error raised by world mutations (mapped to MCP errors by servers)."""
+
+
+class ElicitationUnavailable(Exception):
+    """Raised by a server's elicit fn when the CLIENT has no elicitation
+    capability (M3.1, SPEC.md §18). The world catches it and falls back to
+    its legacy no-channel policy, so capability-free clients keep the
+    pre-M3.1 behavior exactly (honest degradation, not a faked answer)."""
+
+
+# ---- elicitation seam (SPEC.md §18, M3.1) ----
+
+#: The world's elicitation callback contract. The WORLD owns the policy
+#: (which situations require clarification/approval and what the answer
+#: means); the SERVER VARIANT owns the protocol mechanics behind the
+#: callback (official SDK: imperative ``elicitation/create`` via
+#: ``ServerSession.elicit_form``; FastMCP 4 on 2026-07-28: the SEP-2322
+#: ``InputRequiredResult`` guard pattern). The callback receives the
+#: normalized request ``{kind, question, schema}`` and returns the
+#: normalized response ``{status: approved|declined|clarified, answer: ...}``.
+#:
+#: The seam methods are async precisely so this measurement stays honest:
+#: the application code (this module) is identical across SDK variants and
+#: only the callback — the protocol-specific code — differs.
+ElicitFn = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+
+#: Kinds of elicitation the world can request.
+ELICIT_CLARIFICATION = "clarification"
+ELICIT_APPROVAL = "approval"
+
+#: Canonical decline message for a rejected production-deployment approval.
+DEPLOYMENT_DECLINED = "deployment declined by user"
+
+
+def clarification_payload(field: str, question: str) -> dict[str, Any]:
+    """Normalized clarification request: ask the user for one string field."""
+    return {
+        "kind": ELICIT_CLARIFICATION,
+        "question": question,
+        "schema": {
+            "type": "object",
+            # Root "title" doubles as the machine-readable kind marker; the
+            # restricted requestedSchema subset ignores unknown root keys,
+            # so clients also recover kind from the schema shape.
+            "title": ELICIT_CLARIFICATION,
+            "properties": {field: {"type": "string", "title": field}},
+            "required": [field],
+        },
+    }
+
+
+def approval_payload(question: str) -> dict[str, Any]:
+    """Normalized approval request: ask the user for a boolean decision."""
+    return {
+        "kind": ELICIT_APPROVAL,
+        "question": question,
+        "schema": {
+            "type": "object",
+            "title": ELICIT_APPROVAL,
+            "properties": {"approved": {"type": "boolean", "title": "Approved"}},
+            "required": ["approved"],
+        },
+    }
+
+
+def requested_field(payload: dict[str, Any]) -> str:
+    """The single required property of a clarification payload's schema."""
+    required = (payload.get("schema") or {}).get("required") or []
+    return str(required[0]) if required else "value"
+
+
+def elicitation_response(
+    action: str, content: dict[str, Any] | None, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Normalize a wire-level elicitation outcome (the MCP ElicitResult
+    action/content shape) into the world seam's response dict.
+
+    accept + approval payload -> approved iff content.approved is truthy;
+    accept + clarification payload -> clarified with the requested field's
+    value; decline/cancel -> declined (the world's policy maps that to a
+    WorldError).
+    """
+    if action != "accept":
+        return {"status": "declined"}
+    data = content or {}
+    if payload.get("kind") == ELICIT_APPROVAL:
+        return {"status": "approved" if data.get("approved") else "declined"}
+    return {"status": "clarified", "answer": data.get(requested_field(payload))}
 
 
 # ---- schema probe (SPEC.md §8 SCHEMA) ----
@@ -196,9 +284,42 @@ class World(BaseModel):
     def get_inventory(self) -> dict[str, InventoryItem]:
         return dict(self.inventory)
 
-    def reserve_inventory(self, item: str, employee_id: str) -> InventoryItem:
+    async def reserve_inventory(
+        self,
+        item: str,
+        employee_id: str | None = None,
+        *,
+        elicit: ElicitFn | None = None,
+    ) -> InventoryItem:
+        """Reserve one unit of an item for an employee (SPEC.md §18).
+
+        Clarification policy (world-owned): a missing employee_id requires
+        asking the user. With an `elicit` callback the world requests a
+        clarification and the answer becomes the employee id; a decline (or
+        empty answer) raises WorldError. Without a callback the call raises
+        on the missing employee — the pre-M3.1 behavior for a request the
+        server cannot clarify.
+        """
         if item not in self.inventory:
             raise WorldError(f"unknown inventory item {item}")
+        if employee_id is None:
+            if elicit is None:
+                raise WorldError(f"reserve_inventory for {item} requires an employee id")
+            try:
+                response = await elicit(
+                    clarification_payload(
+                        "employee_id",
+                        f"Which employee should the {item} reservation be recorded for?",
+                    )
+                )
+            except ElicitationUnavailable:
+                # Client cannot answer elicitations: legacy behavior.
+                raise WorldError(
+                    f"reserve_inventory for {item} requires an employee id"
+                ) from None
+            if response.get("status") != "clarified" or not response.get("answer"):
+                raise WorldError("reservation declined by user")
+            employee_id = str(response["answer"])
         if employee_id not in self.employees:
             raise WorldError(f"unknown employee {employee_id}")
         inv = self.inventory[item]
@@ -214,15 +335,41 @@ class World(BaseModel):
             raise WorldError(f"unknown deployment {service}")
         return self.deployments[service]
 
-    def deploy_service(
+    async def deploy_service(
         self,
         service: str,
         target_version: str,
         environment: str,
+        *,
+        elicit: ElicitFn | None = None,
     ) -> Deployment:
+        """Deploy a service (SPEC.md §18 approval flow).
+
+        Approval policy (world-owned): a production deploy requires explicit
+        user approval when an elicitation channel exists; a decline raises
+        WorldError(DEPLOYMENT_DECLINED) and the world is left unchanged.
+        Without a callback the pre-M3.1 guard applies unchanged (production
+        deploys of services not already in production are rejected).
+        """
         dep = self.get_deployment(service)
-        if environment == "production" and dep.environment != environment:
-            raise WorldError(f"{service} is not deployed in {environment}")
+        if environment == "production":
+            if elicit is not None:
+                try:
+                    response = await elicit(
+                        approval_payload(
+                            f"Approve deployment of {service} {target_version} to production?"
+                        )
+                    )
+                except ElicitationUnavailable:
+                    # Client cannot answer elicitations: legacy guard below.
+                    elicit = None
+                else:
+                    if response.get("status") != "approved":
+                        raise WorldError(DEPLOYMENT_DECLINED)
+            # Legacy pre-M3.1 guard (no elicitation channel): production
+            # deploys of services not already in production are rejected.
+            if elicit is None and dep.environment != environment:
+                raise WorldError(f"{service} is not deployed in {environment}")
         dep.version = target_version
         dep.environment = environment
         dep.status = DeploymentStatus.ACTIVE

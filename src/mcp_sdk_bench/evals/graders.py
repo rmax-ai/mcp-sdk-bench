@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any
 
 from mcp_sdk_bench.adapters.base import MCPAdapter
+from mcp_sdk_bench.world.fixtures import seed_world
 
 # Resource/prompt access is recorded in the trace as pseudo tool calls
 # (see benchmark.runner.AccessRecordingAdapter). They are excluded from the
@@ -26,11 +27,17 @@ def _used_names(result: dict) -> list[str]:
 
 def _tool_selection(task: dict, used_names: list[str]) -> tuple[float, int]:
     expected = {n for n in task["expected_tools"] if n not in PSEUDO_TOOLS}
+    allowed = expected | {
+        n for n in task.get("allowed_extra_tools") or [] if n not in PSEUDO_TOOLS
+    }
     used = {n for n in used_names if n not in PSEUDO_TOOLS}
     unnecessary = sum(
         1 for n in used_names if n not in PSEUDO_TOOLS and n not in expected
     )
-    return (1.0 if used == expected else 0.0), unnecessary
+    # Every expected tool must be used; anything used must be expected or
+    # explicitly allowed. Rows without allowed extras keep the M1 semantics
+    # (used == expected exactly).
+    return (1.0 if expected <= used <= allowed else 0.0), unnecessary
 
 
 def _argument_accuracy(task: dict, result: dict) -> float:
@@ -63,7 +70,24 @@ def _plain(value: Any) -> Any:
     return value.value if isinstance(value, Enum) else value
 
 
-async def _correct_final_state(task: dict, adapter: MCPAdapter) -> float:
+def _deployment_from_call_log(service: str, call_log: list[dict]) -> dict | None:
+    """Final deployment state as observable through the tool surface: the
+    LAST successful deploy_service result for the service (mirrors
+    benchmark.reliability). Paused elicitation legs carry no result and are
+    skipped."""
+    entity: dict | None = None
+    for entry in call_log:
+        if entry.get("elicitation_request"):
+            continue
+        if entry.get("name") != "deploy_service" or entry.get("is_error"):
+            continue
+        if (entry.get("arguments") or {}).get("service") != service:
+            continue
+        entity = (entry.get("structured_content") or {}).get("deployment")
+    return entity
+
+
+async def _correct_final_state(task: dict, result: dict, adapter: MCPAdapter) -> float:
     for check_id, fields in task["expected_final_state"].items():
         kind, _, key = check_id.partition(":")
         try:
@@ -78,6 +102,17 @@ async def _correct_final_state(task: dict, adapter: MCPAdapter) -> float:
                     return 0.0
                 items = res.structured_content.get("items") or {}
                 entity = items.get(key)
+            elif kind == "deployment":
+                # No read tool for deployments exists in the contract (M2.3b
+                # convention): the last successful deploy_service result is
+                # the observable final state. When the run never deployed
+                # the service, per-task world isolation (SPEC.md §23) makes
+                # the SEEDED deployment the ground truth — this is how
+                # "unchanged" is graded for abstention/decline tasks.
+                entity = _deployment_from_call_log(key, result.get("tool_call_log") or [])
+                if entity is None:
+                    seeded = seed_world().deployments.get(key)
+                    entity = seeded.model_dump(mode="json") if seeded is not None else None
             else:
                 return 0.0
         except Exception:  # noqa: BLE001 — any adapter error fails the check, never the grader
@@ -115,11 +150,20 @@ async def grade_task(task: dict, result: dict, adapter: MCPAdapter) -> dict:
         tool_selection, unnecessary = _tool_selection(task, used_names)
         argument_accuracy = _argument_accuracy(task, result)
         trajectory = _trajectory_correctness(task, used_names)
-        final_state = await _correct_final_state(task, adapter)
+        final_state = await _correct_final_state(task, result, adapter)
         answer_quality = _answer_quality(task, result)
+        # M3.1 (SPEC.md §18): interactive tasks declare the minimum number
+        # of scripted-user interactions the run must show (clarify-hook
+        # injections + elicitation responses); absent means no requirement.
+        user_interactions = int(result.get("user_interactions") or 0)
+        min_interactions = task.get("min_user_interactions")
+        interactions_ok = min_interactions is None or user_interactions >= min_interactions
         task_success = (
             1.0
-            if final_state == 1.0 and answer_quality == 1.0 and tool_selection == 1.0
+            if final_state == 1.0
+            and answer_quality == 1.0
+            and tool_selection == 1.0
+            and interactions_ok
             else 0.0
         )
         return {
@@ -133,6 +177,7 @@ async def grade_task(task: dict, result: dict, adapter: MCPAdapter) -> dict:
             "unnecessary_tool_calls": unnecessary,
             "tool_call_count": len(result.get("tool_calls") or []),
             "round_trips": int(result.get("round_trips") or 0),
+            "user_interactions": user_interactions,
         }
     except Exception as err:  # noqa: BLE001 — grading must be total; a malformed result is data
         return {
@@ -146,5 +191,6 @@ async def grade_task(task: dict, result: dict, adapter: MCPAdapter) -> dict:
             "unnecessary_tool_calls": 0,
             "tool_call_count": 0,
             "round_trips": 0,
+            "user_interactions": 0,
             "error": f"{type(err).__name__}: {err}",
         }

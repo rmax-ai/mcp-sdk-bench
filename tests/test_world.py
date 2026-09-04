@@ -31,23 +31,23 @@ def test_create_ticket_records_op() -> None:
     assert ops[0].seq == len(w.op_log) - 1
 
 
-def test_reserve_inventory_mutates_and_records() -> None:
+async def test_reserve_inventory_mutates_and_records() -> None:
     w = reset_world()
-    inv = w.reserve_inventory("thinkpad-t14", "alice")
+    inv = await w.reserve_inventory("thinkpad-t14", "alice")
     assert inv.available == 1
     assert inv.reserved_by == ["alice"]
     assert w.op_log[-1].op == "reserve_inventory"
 
 
-def test_reserve_unknown_or_empty_fails() -> None:
+async def test_reserve_unknown_or_empty_fails() -> None:
     w = reset_world()
     try:
-        w.reserve_inventory("macbook-pro", "alice")
+        await w.reserve_inventory("macbook-pro", "alice")
         raise AssertionError("expected WorldError")
     except WorldError:
         pass
     try:
-        w.reserve_inventory("hoverboard", "alice")
+        await w.reserve_inventory("hoverboard", "alice")
         raise AssertionError("expected WorldError")
     except WorldError:
         pass
@@ -60,8 +60,8 @@ def test_search_documents() -> None:
     assert w.search_documents("zzz-not-there") == []
 
 
-def test_deploy_service_updates_version() -> None:
+async def test_deploy_service_updates_version() -> None:
     w = reset_world()
-    dep = w.deploy_service("payments-api", "2.5.0", "staging")
+    dep = await w.deploy_service("payments-api", "2.5.0", "staging")
     assert dep.version == "2.5.0"
     assert w.op_log[-1].op == "deploy_service"
