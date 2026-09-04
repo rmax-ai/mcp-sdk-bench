@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mcpbench = "mcp_sdk_bench.cli:main"
+mcpbench = "mcp_sdk_bench.cli:app"
 
 [build-system]
 requires = ["uv_build>=0.11.13,<0.12.0"]

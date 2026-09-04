@@ -80,6 +80,13 @@ def test_report_generates_all_artifacts(isolate_results) -> None:
     assert interop["status"] == "not-yet-run"  # honest marker, not fabricated data
 
 
+def test_repo_root_resolves_to_repo() -> None:
+    from mcp_sdk_bench.benchmark.sweep import REPO_ROOT
+
+    assert (REPO_ROOT / "pyproject.toml").exists()
+    assert (REPO_ROOT / "datasets" / "basic.jsonl").exists()
+
+
 def test_report_requires_eval_files(isolate_results) -> None:
     with pytest.raises(FileNotFoundError):
         result_mod.report("missing-run")

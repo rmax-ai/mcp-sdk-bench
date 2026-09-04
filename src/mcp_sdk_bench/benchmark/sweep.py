@@ -28,7 +28,7 @@ from mcp_sdk_bench.benchmark.traces import TraceRecorder
 from mcp_sdk_bench.evals.datasets import load_dataset
 from mcp_sdk_bench.evals.graders import grade_task
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 DATASET_PATHS = [REPO_ROOT / "datasets" / "basic.jsonl", REPO_ROOT / "datasets" / "composition.jsonl"]
 
 _ADAPTER_CLASSES: dict[str, Any] = {
