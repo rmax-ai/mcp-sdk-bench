@@ -52,3 +52,14 @@ def test_eval_rejects_unknown_sdk() -> None:
     r = run_mcpbench("eval", "--sdk", "bogus")
     assert r.returncode == 2
     assert "unknown sdk" in r.stdout
+
+
+def test_adk_availability_matches_real_env_check() -> None:
+    """_available_adapters must gate adk on adk_env_ok() — google.adk is
+    importable in the main env but its mcp_toolset import FAILS on the
+    mcp 1.x/2.x clash, so any weaker check makes the failures/eval commands
+    run ADK inline and crash at connect() (regression, 2026-09-04)."""
+    from mcp_sdk_bench.adapters.adk import adk_env_ok
+    from mcp_sdk_bench.cli import _available_adapters
+
+    assert ("adk" in _available_adapters()) == adk_env_ok()

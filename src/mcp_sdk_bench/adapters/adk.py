@@ -52,6 +52,28 @@ def _server_env() -> dict[str, str]:
     return env
 
 
+def adk_env_ok() -> bool:
+    """True only when the real ADK imports EXECUTE (not just resolve).
+
+    google.adk is installed in the main env too, but importing mcp_toolset
+    there raises ImportError because google-adk[mcp] needs mcp 1.x while the
+    main env pins mcp 2.x (DECISIONS.md D1). find_spec-based checks miss
+    this; execute the exact import chain connect() needs instead."""
+    try:
+        from google.adk.agents.invocation_context import InvocationContext  # noqa: F401
+        from google.adk.sessions import InMemorySessionService  # noqa: F401
+        from google.adk.tools.mcp_tool.mcp_toolset import (  # noqa: F401
+            McpToolset,
+            StdioConnectionParams,
+        )
+        from google.adk.tools.tool_context import ToolContext  # noqa: F401
+        from mcp import StdioServerParameters  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 class AdkAdapter(MCPAdapter):
     def __init__(self) -> None:
         self._toolset: Any = None
@@ -59,17 +81,17 @@ class AdkAdapter(MCPAdapter):
         self._context_factory: Any = None
 
     async def connect(self) -> Discovery:
-        try:
-            from google.adk.agents.invocation_context import InvocationContext
-            from google.adk.sessions import InMemorySessionService
-            from google.adk.tools.mcp_tool.mcp_toolset import (
-                McpToolset,
-                StdioConnectionParams,
-            )
-            from google.adk.tools.tool_context import ToolContext
-            from mcp import StdioServerParameters
-        except ImportError as err:
-            raise RuntimeError(ADK_ENV_MESSAGE) from err
+        if not adk_env_ok():
+            raise RuntimeError(ADK_ENV_MESSAGE)
+
+        from google.adk.agents.invocation_context import InvocationContext
+        from google.adk.sessions import InMemorySessionService
+        from google.adk.tools.mcp_tool.mcp_toolset import (
+            McpToolset,
+            StdioConnectionParams,
+        )
+        from google.adk.tools.tool_context import ToolContext
+        from mcp import StdioServerParameters
 
         self._toolset = McpToolset(
             connection_params=StdioConnectionParams(

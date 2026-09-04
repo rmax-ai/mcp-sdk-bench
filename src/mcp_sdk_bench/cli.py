@@ -18,6 +18,17 @@ from mcp_sdk_bench.benchmark import result as result_mod
 from mcp_sdk_bench.benchmark.result import new_run_id
 from mcp_sdk_bench.benchmark.sweep import REPO_ROOT, environment_snapshot, sweep_sync
 
+
+def _available_adapters() -> dict[str, type]:
+    from mcp_sdk_bench.adapters import AdkAdapter, FastMCPAdapter, OfficialAdapter
+    from mcp_sdk_bench.adapters.adk import adk_env_ok
+
+    return {
+        name: cls
+        for name, cls in (("official", OfficialAdapter), ("fastmcp", FastMCPAdapter), ("adk", AdkAdapter))
+        if cls is not None and (name != "adk" or adk_env_ok())
+    }
+
 app = typer.Typer(
     name="mcpbench",
     help="MCP SDK benchmark: FastMCP 4.x vs Google ADK vs official MCP Python SDK v2.",
@@ -152,14 +163,9 @@ def eval(
     run_id: str = typer.Option(None, "--run-id", help="Run id (default: new)"),
 ) -> None:
     """Run the agent evaluation suite (SPEC.md §9-11)."""
-    from mcp_sdk_bench.adapters import AdkAdapter, FastMCPAdapter, OfficialAdapter
 
     rid = run_id or new_run_id()
-    available = {
-        name: cls
-        for name, cls in (("official", OfficialAdapter), ("fastmcp", FastMCPAdapter), ("adk", AdkAdapter))
-        if cls is not None
-    }
+    available = _available_adapters()
     if sdk == "all":
         targets = [name for name in ("official", "fastmcp") if name in available]
         if "adk" in available:
@@ -295,7 +301,6 @@ def failures(
     """
     import asyncio
 
-    from mcp_sdk_bench.adapters import AdkAdapter, FastMCPAdapter, OfficialAdapter
     from mcp_sdk_bench.benchmark.reliability import (
         DEFAULT_FAULT_CONFIGS,
         fault_config_label,
@@ -313,11 +318,7 @@ def failures(
         )
         raise typer.Exit(code=2)
 
-    available = {
-        name: cls
-        for name, cls in (("official", OfficialAdapter), ("fastmcp", FastMCPAdapter), ("adk", AdkAdapter))
-        if cls is not None
-    }
+    available = _available_adapters()
     requested = sdk or ["official", "fastmcp", "adk"]
     unknown_sdks = [s for s in requested if s not in ("official", "fastmcp", "adk")]
     if unknown_sdks:
