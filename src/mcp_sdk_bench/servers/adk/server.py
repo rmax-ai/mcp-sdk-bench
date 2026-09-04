@@ -1,11 +1,14 @@
 """ADK server variant — SPEC.md §6, Milestone 1 (google-adk 2.8.0, mcp 1.29.1).
 
-The five world operations are defined as ADK-native ``FunctionTool`` objects
+The world operations are defined as ADK-native ``FunctionTool`` objects
 (the exact tool objects an ADK agent calls) and hosted on an ``LlmAgent``.
 They are then exposed over MCP stdio with the M1 contract identical to the
-official-SDK variant: same 5 tools, same parameter names and field
+official-SDK variant: same tools, same parameter names and field
 descriptions, same resource, same prompt. M2.1 adds a sixth FunctionTool,
 ``probe_schema`` (SPEC.md §8 SCHEMA echo probe), registered the same way.
+M2.3a adds a seventh, ``create_ticket`` (SPEC.md §21 idempotent creation),
+plus the shared deterministic fault layer (mcp_sdk_bench.faults), driven by
+env vars read once at startup — identical semantics to the other variants.
 
 Deviation note (recorded per AGENTS.md §5 honesty rules): ADK 2.8's only
 agent-as-MCP-server path is ``to_mcp_server`` in the private module
@@ -41,8 +44,9 @@ Smoke self-check (spawns the server over stdio, lists tools, exits 0):
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import Enum
-from typing import Annotated, Any
+from typing import Annotated, Any, TypeVar
 
 from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
@@ -50,6 +54,12 @@ from mcp.server.fastmcp import FastMCP  # ty: ignore[unresolved-import]
 from mcp.server.fastmcp.exceptions import ToolError  # ty: ignore[unresolved-import]
 from pydantic import BaseModel, Field
 
+from mcp_sdk_bench.faults import (
+    FaultEngine,
+    InjectedToolFault,
+    load_fault_config,
+    run_tool_with_faults,
+)
 from mcp_sdk_bench.world import (
     Deployment,
     InventoryItem,
@@ -110,6 +120,9 @@ class SchemaEnum(str, Enum):
     GAMMA = "gamma"
 
 
+_T = TypeVar("_T")
+
+
 def _incident_triage_text(ticket_id: str) -> str:
     return (
         f"You are triaging incident ticket {ticket_id}. Follow these steps in order:\n"
@@ -123,22 +136,31 @@ def _incident_triage_text(ticket_id: str) -> str:
 
 
 def build_agent(world: World) -> LlmAgent:
-    """Build the ADK agent hosting the five world operations as FunctionTools.
+    """Build the ADK agent hosting the world operations as FunctionTools.
 
     Tool docstrings are the contract descriptions — ADK's FunctionTool reads
-    name/description from the wrapped function.
+    name/description from the wrapped function. Fault config is read from the
+    environment once, here, at agent build (= server startup, SPEC.md §21).
     """
+    fault_engine = FaultEngine(load_fault_config())
 
-    def get_ticket(
+    async def _run(
+        execute: Callable[[], _T], *, is_replay: Callable[[], bool] = lambda: False
+    ) -> _T:
+        """Shared dispatch through the deterministic fault layer (SPEC.md
+        §21); identical semantics to the other two server variants."""
+        try:
+            return await run_tool_with_faults(fault_engine, execute, is_replay=is_replay)
+        except (InjectedToolFault, WorldError) as err:
+            raise ToolError(str(err)) from err
+
+    async def get_ticket(
         ticket_id: Annotated[str, Field(description="Ticket identifier, e.g. PAY-123")],
     ) -> TicketOutput:
         """Fetch a single ticket by id."""
-        try:
-            return TicketOutput(ticket=world.get_ticket(ticket_id))
-        except WorldError as err:
-            raise ToolError(str(err)) from err
+        return await _run(lambda: TicketOutput(ticket=world.get_ticket(ticket_id)))
 
-    def update_ticket(
+    async def update_ticket(
         ticket_id: Annotated[str, Field(description="Ticket identifier, e.g. PAY-123")],
         status: Annotated[
             TicketStatus | None,
@@ -150,28 +172,49 @@ def build_agent(world: World) -> LlmAgent:
         ] = None,
     ) -> TicketOutput:
         """Update a ticket's status and/or assignee."""
-        try:
-            return TicketOutput(ticket=world.update_ticket(ticket_id, status, assignee))
-        except WorldError as err:
-            raise ToolError(str(err)) from err
+        return await _run(
+            lambda: TicketOutput(ticket=world.update_ticket(ticket_id, status, assignee))
+        )
 
-    def get_inventory() -> InventoryOutput:
+    async def create_ticket(
+        ticket_id: Annotated[str, Field(description="Ticket identifier to create, e.g. T-1")],
+        title: Annotated[str, Field(description="Ticket title")],
+        idempotency_key: Annotated[
+            str,
+            Field(
+                description="Idempotency key; a retry with the same key returns the existing ticket"
+            ),
+        ],
+        priority: Annotated[
+            str | None, Field(description="Ticket priority, e.g. high; omit for none")
+        ] = None,
+    ) -> TicketOutput:
+        """Create a ticket; idempotent on idempotency_key (SPEC.md §21)."""
+        return await _run(
+            lambda: TicketOutput(
+                ticket=world.create_ticket(
+                    ticket_id, title, priority, idempotency_key=idempotency_key
+                )
+            ),
+            is_replay=lambda: world.ticket_for_idempotency_key(idempotency_key) is not None,
+        )
+
+    async def get_inventory() -> InventoryOutput:
         """List all inventory items with availability."""
-        return InventoryOutput(items=world.get_inventory())
+        return await _run(lambda: InventoryOutput(items=world.get_inventory()))
 
-    def reserve_inventory(
+    async def reserve_inventory(
         item: Annotated[str, Field(description="Inventory item name, e.g. thinkpad-t14")],
         employee_id: Annotated[
             str, Field(description="Employee id making the reservation, e.g. alice")
         ],
     ) -> ReserveInventoryOutput:
         """Reserve one unit of an inventory item for an employee."""
-        try:
-            return ReserveInventoryOutput(item=world.reserve_inventory(item, employee_id))
-        except WorldError as err:
-            raise ToolError(str(err)) from err
+        return await _run(
+            lambda: ReserveInventoryOutput(item=world.reserve_inventory(item, employee_id))
+        )
 
-    def deploy_service(
+    async def deploy_service(
         service: Annotated[str, Field(description="Service name, e.g. checkout")],
         target_version: Annotated[str, Field(description="Version to deploy, e.g. 1.8.3")],
         environment: Annotated[
@@ -179,14 +222,13 @@ def build_agent(world: World) -> LlmAgent:
         ],
     ) -> DeploymentOutput:
         """Deploy a service at a target version to an environment."""
-        try:
-            return DeploymentOutput(
+        return await _run(
+            lambda: DeploymentOutput(
                 deployment=world.deploy_service(service, target_version, environment)
             )
-        except WorldError as err:
-            raise ToolError(str(err)) from err
+        )
 
-    def probe_schema(
+    async def probe_schema(
         string_field: str,
         int_field: int,
         float_field: float,
@@ -199,8 +241,8 @@ def build_agent(world: World) -> LlmAgent:
         nested_list_field: list[ProbeNestedItem],
     ) -> ProbeSchemaOutput:
         """Side-effect-free echo probe exercising every JSON-schema primitive (SPEC.md §8 SCHEMA)."""
-        try:
-            return ProbeSchemaOutput(
+        return await _run(
+            lambda: ProbeSchemaOutput(
                 **world.probe_schema(
                     string_field=string_field,
                     int_field=int_field,
@@ -214,14 +256,14 @@ def build_agent(world: World) -> LlmAgent:
                     nested_list_field=nested_list_field,
                 )
             )
-        except WorldError as err:
-            raise ToolError(str(err)) from err
+        )
 
     tools = [
         FunctionTool(func=fn)
         for fn in (
             get_ticket,
             update_ticket,
+            create_ticket,
             get_inventory,
             reserve_inventory,
             deploy_service,

@@ -6,12 +6,15 @@ honestly represents the official SDK, not a fastmcp-style helper.
 M1 surface: 5 tools (get_ticket, update_ticket, get_inventory, reserve_inventory,
 deploy_service), 1 resource (company://policies/deployment), 1 prompt
 (incident-triage). M2.1 adds probe_schema, a side-effect-free echo probe for
-the SPEC.md §8 SCHEMA conformance category. One World instance per server
-process, seeded at startup; no disk persistence.
+the SPEC.md §8 SCHEMA conformance category. M2.3a adds create_ticket (SPEC.md
+§21 idempotent creation) and the shared deterministic fault layer
+(mcp_sdk_bench.faults), driven by env vars read once at startup. One World
+instance per server process, seeded at startup; no disk persistence.
 """
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any, Literal
 
 from mcp import types
@@ -20,6 +23,12 @@ from mcp.server.lowlevel.server import ServerRequestContext
 from mcp.shared.exceptions import MCPError
 from pydantic import BaseModel, Field, ValidationError
 
+from mcp_sdk_bench.faults import (
+    FaultEngine,
+    InjectedToolFault,
+    load_fault_config,
+    run_tool_with_faults,
+)
 from mcp_sdk_bench.world import (
     PROBE_SCHEMA_ENUM_VALUES,
     Deployment,
@@ -74,6 +83,17 @@ class DeployServiceInput(BaseModel):
     service: str = Field(description="Service name, e.g. checkout")
     target_version: str = Field(description="Version to deploy, e.g. 1.8.3")
     environment: str = Field(description="Target environment, e.g. staging or production")
+
+
+class CreateTicketInput(BaseModel):
+    ticket_id: str = Field(description="Ticket identifier to create, e.g. T-1")
+    title: str = Field(description="Ticket title")
+    priority: str | None = Field(
+        default=None, description="Ticket priority, e.g. high; omit for none"
+    )
+    idempotency_key: str = Field(
+        description="Idempotency key; a retry with the same key returns the existing ticket"
+    )
 
 
 # probe_schema is registered with an EXPLICIT inputSchema (not a pydantic-
@@ -183,14 +203,21 @@ def _incident_triage_text(ticket_id: str) -> str:
 
 def create_server() -> Server[Any]:
     """Build the official-SDK M1 server. A fresh seeded World is created here,
-    so each server process owns exactly one in-memory world instance."""
+    so each server process owns exactly one in-memory world instance. Fault
+    config is read from the environment once, here, at startup (SPEC.md §21)."""
     world: World = reset_world()
+    fault_engine = FaultEngine(load_fault_config())
 
     tool_specs: dict[str, tuple[str, type[BaseModel], type[BaseModel]]] = {
         "get_ticket": ("Fetch a single ticket by id.", GetTicketInput, TicketOutput),
         "update_ticket": (
             "Update a ticket's status and/or assignee.",
             UpdateTicketInput,
+            TicketOutput,
+        ),
+        "create_ticket": (
+            "Create a ticket; idempotent on idempotency_key (SPEC.md §21).",
+            CreateTicketInput,
             TicketOutput,
         ),
         "get_inventory": (
@@ -246,60 +273,103 @@ def create_server() -> Server[Any]:
             is_error=True,
         )
 
-    def _call_probe(arguments: dict[str, Any] | None) -> types.CallToolResult:
+    def _validated_call(
+        name: str, arguments: dict[str, Any] | None
+    ) -> tuple[Callable[[], types.CallToolResult], Callable[[], bool]]:
+        """Validate arguments and return (execute, is_replay) thunks.
+
+        Validation runs BEFORE any fault draw so protocol-level errors
+        (unknown tool / invalid params) are never masked by injected faults.
+        `is_replay` reports whether the call is an idempotent replay
+        (create_ticket with an already-used key — SPEC.md §21); replays
+        bypass the fault layer because they execute no transaction.
+        """
+        if name == PROBE_SCHEMA_TOOL:
+            try:
+                probe = ProbeSchemaInput.model_validate(arguments or {})
+            except ValidationError as err:
+                raise MCPError(
+                    INVALID_PARAMS, f"invalid arguments for {PROBE_SCHEMA_TOOL}: {err}"
+                ) from err
+
+            def execute_probe() -> types.CallToolResult:
+                echo = world.probe_schema(
+                    string_field=probe.string_field,
+                    int_field=probe.int_field,
+                    float_field=probe.float_field,
+                    bool_field=probe.bool_field,
+                    enum_field=probe.enum_field,
+                    nullable_field=probe.nullable_field,
+                    union_field=probe.union_field,
+                    list_field=probe.list_field,
+                    nested_field=probe.nested_field,
+                    nested_list_field=probe.nested_list_field,
+                )
+                return _ok(ProbeSchemaOutput(**echo))
+
+            return execute_probe, lambda: False
+
+        spec = tool_specs.get(name)
+        if spec is None:
+            raise MCPError(INVALID_PARAMS, f"unknown tool {name}")
+        _, input_model, _ = spec
         try:
-            args = ProbeSchemaInput.model_validate(arguments or {})
+            args = input_model.model_validate(arguments or {})
         except ValidationError as err:
-            raise MCPError(
-                INVALID_PARAMS, f"invalid arguments for {PROBE_SCHEMA_TOOL}: {err}"
-            ) from err
-        try:
-            echo = world.probe_schema(
-                string_field=args.string_field,
-                int_field=args.int_field,
-                float_field=args.float_field,
-                bool_field=args.bool_field,
-                enum_field=args.enum_field,
-                nullable_field=args.nullable_field,
-                union_field=args.union_field,
-                list_field=args.list_field,
-                nested_field=args.nested_field,
-                nested_list_field=args.nested_list_field,
-            )
-        except WorldError as err:
-            return _world_error(err)
-        return _ok(ProbeSchemaOutput(**echo))
+            raise MCPError(INVALID_PARAMS, f"invalid arguments for {name}: {err}") from err
+        match args:
+            case GetTicketInput(ticket_id=ticket_id):
+                return lambda: _ok(TicketOutput(ticket=world.get_ticket(ticket_id))), (
+                    lambda: False
+                )
+            case UpdateTicketInput(ticket_id=ticket_id, status=status, assignee=assignee):
+                return (
+                    lambda: _ok(TicketOutput(ticket=world.update_ticket(ticket_id, status, assignee))),
+                    lambda: False,
+                )
+            case CreateTicketInput(
+                ticket_id=ticket_id, title=title, priority=priority, idempotency_key=key
+            ):
+                return (
+                    lambda: _ok(
+                        TicketOutput(
+                            ticket=world.create_ticket(
+                                ticket_id, title, priority, idempotency_key=key
+                            )
+                        )
+                    ),
+                    lambda: world.ticket_for_idempotency_key(key) is not None,
+                )
+            case GetInventoryInput():
+                return lambda: _ok(InventoryOutput(items=world.get_inventory())), lambda: False
+            case ReserveInventoryInput(item=item, employee_id=employee_id):
+                return (
+                    lambda: _ok(ReserveInventoryOutput(item=world.reserve_inventory(item, employee_id))),
+                    lambda: False,
+                )
+            case DeployServiceInput(service=service, target_version=version, environment=env):
+                return (
+                    lambda: _ok(DeploymentOutput(deployment=world.deploy_service(service, version, env))),
+                    lambda: False,
+                )
+        raise MCPError(INVALID_PARAMS, f"unknown tool {name}")  # pragma: no cover
+
+    def _injected_fault(err: InjectedToolFault) -> types.CallToolResult:
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=str(err))],
+            is_error=True,
+        )
 
     async def on_call_tool(
         _ctx: ServerRequestContext[Any], params: types.CallToolRequestParams
     ) -> types.CallToolResult:
-        if params.name == PROBE_SCHEMA_TOOL:
-            return _call_probe(params.arguments)
-        spec = tool_specs.get(params.name)
-        if spec is None:
-            raise MCPError(INVALID_PARAMS, f"unknown tool {params.name}")
-        _, input_model, _ = spec
+        execute, is_replay = _validated_call(params.name, params.arguments)
         try:
-            args = input_model.model_validate(params.arguments or {})
-        except ValidationError as err:
-            raise MCPError(INVALID_PARAMS, f"invalid arguments for {params.name}: {err}") from err
-        try:
-            match args:
-                case GetTicketInput(ticket_id=ticket_id):
-                    return _ok(TicketOutput(ticket=world.get_ticket(ticket_id)))
-                case UpdateTicketInput(ticket_id=ticket_id, status=status, assignee=assignee):
-                    return _ok(TicketOutput(ticket=world.update_ticket(ticket_id, status, assignee)))
-                case GetInventoryInput():
-                    return _ok(InventoryOutput(items=world.get_inventory()))
-                case ReserveInventoryInput(item=item, employee_id=employee_id):
-                    return _ok(ReserveInventoryOutput(item=world.reserve_inventory(item, employee_id)))
-                case DeployServiceInput(service=service, target_version=version, environment=env):
-                    return _ok(
-                        DeploymentOutput(deployment=world.deploy_service(service, version, env))
-                    )
+            return await run_tool_with_faults(fault_engine, execute, is_replay=is_replay)
+        except InjectedToolFault as err:
+            return _injected_fault(err)
         except WorldError as err:
             return _world_error(err)
-        raise MCPError(INVALID_PARAMS, f"unknown tool {params.name}")  # pragma: no cover
 
     async def on_list_resources(
         _ctx: ServerRequestContext[Any], _params: types.PaginatedRequestParams | None

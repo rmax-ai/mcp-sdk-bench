@@ -22,8 +22,9 @@ def test_fixture_integrity() -> None:
 
 def test_create_ticket_records_op() -> None:
     w = reset_world()
-    t = w.create_ticket(title="Onboard new engineer", team="payments")
+    t = w.create_ticket("T-1", title="Onboard new engineer", idempotency_key="K-1")
     assert t.status == TicketStatus.OPEN
+    assert t.idempotency_key == "K-1"
     ops = [o for o in w.op_log if o.op == "create_ticket"]
     assert len(ops) == 1
     assert ops[0].entity_id == t.id

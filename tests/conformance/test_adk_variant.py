@@ -26,6 +26,7 @@ from mcp import StdioServerParameters
 EXPECTED_TOOLS = {
     "get_ticket",
     "update_ticket",
+    "create_ticket",
     "get_inventory",
     "reserve_inventory",
     "deploy_service",
@@ -41,7 +42,7 @@ def _server_env() -> dict[str, str]:
     return env
 
 
-async def test_adk_mcptoolset_lists_the_six_m21_tools() -> None:
+async def test_adk_mcptoolset_lists_the_seven_m23a_tools() -> None:
     """McpToolset (ADK client) over stdio against the ADK-hosted server."""
     toolset = mcp_toolset.McpToolset(
         connection_params=mcp_toolset.StdioConnectionParams(

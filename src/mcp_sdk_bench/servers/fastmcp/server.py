@@ -10,20 +10,29 @@ M1 surface: 5 tools (get_ticket, update_ticket, get_inventory,
 reserve_inventory, deploy_service), 1 resource (company://policies/deployment),
 1 prompt (incident-triage). M2.1 adds probe_schema, a side-effect-free echo
 probe for the SPEC.md §8 SCHEMA conformance category (schema generated from
-the annotated signature; enum via the SchemaEnum class). One World instance
-per server process, seeded at startup; no disk persistence. WorldError
-surfaces as an MCP tool error (isError) carrying the WorldError message, via
-fastmcp.exceptions.ToolError.
+the annotated signature; enum via the SchemaEnum class). M2.3a adds
+create_ticket (SPEC.md §21 idempotent creation) and the shared deterministic
+fault layer (mcp_sdk_bench.faults), driven by env vars read once at startup.
+One World instance per server process, seeded at startup; no disk persistence.
+WorldError and InjectedToolFault surface as an MCP tool error (isError)
+carrying the error message, via fastmcp.exceptions.ToolError.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import Enum
-from typing import Annotated, Any
+from typing import Annotated, Any, TypeVar
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
 
+from mcp_sdk_bench.faults import (
+    FaultEngine,
+    InjectedToolFault,
+    load_fault_config,
+    run_tool_with_faults,
+)
 from mcp_sdk_bench.world import (
     Deployment,
     InventoryItem,
@@ -92,23 +101,35 @@ def _incident_triage_text(ticket_id: str) -> str:
     )
 
 
+_T = TypeVar("_T")
+
+
 def create_server() -> FastMCP:
     """Build the FastMCP M1 server. A fresh seeded World is created here,
-    so each server process owns exactly one in-memory world instance."""
+    so each server process owns exactly one in-memory world instance. Fault
+    config is read from the environment once, here, at startup (SPEC.md §21)."""
     world: World = reset_world()
+    fault_engine = FaultEngine(load_fault_config())
     server = FastMCP(SERVER_NAME, version=SERVER_VERSION)
 
-    @server.tool(description="Fetch a single ticket by id.")
-    def get_ticket(
-        ticket_id: Annotated[str, Field(description="Ticket identifier, e.g. PAY-123")],
-    ) -> TicketOutput:
+    async def _run(
+        execute: Callable[[], _T], *, is_replay: Callable[[], bool] = lambda: False
+    ) -> _T:
+        """Shared dispatch through the deterministic fault layer (SPEC.md
+        §21); identical semantics to the other two server variants."""
         try:
-            return TicketOutput(ticket=world.get_ticket(ticket_id))
-        except WorldError as err:
+            return await run_tool_with_faults(fault_engine, execute, is_replay=is_replay)
+        except (InjectedToolFault, WorldError) as err:
             raise ToolError(str(err)) from err
 
+    @server.tool(description="Fetch a single ticket by id.")
+    async def get_ticket(
+        ticket_id: Annotated[str, Field(description="Ticket identifier, e.g. PAY-123")],
+    ) -> TicketOutput:
+        return await _run(lambda: TicketOutput(ticket=world.get_ticket(ticket_id)))
+
     @server.tool(description="Update a ticket's status and/or assignee.")
-    def update_ticket(
+    async def update_ticket(
         ticket_id: Annotated[str, Field(description="Ticket identifier, e.g. PAY-123")],
         status: Annotated[
             TicketStatus | None,
@@ -119,41 +140,61 @@ def create_server() -> FastMCP:
             Field(description="Employee id to assign; omit to leave unchanged"),
         ] = None,
     ) -> TicketOutput:
-        try:
-            return TicketOutput(ticket=world.update_ticket(ticket_id, status, assignee))
-        except WorldError as err:
-            raise ToolError(str(err)) from err
+        return await _run(
+            lambda: TicketOutput(ticket=world.update_ticket(ticket_id, status, assignee))
+        )
+
+    @server.tool(description="Create a ticket; idempotent on idempotency_key (SPEC.md §21).")
+    async def create_ticket(
+        ticket_id: Annotated[str, Field(description="Ticket identifier to create, e.g. T-1")],
+        title: Annotated[str, Field(description="Ticket title")],
+        idempotency_key: Annotated[
+            str,
+            Field(
+                description="Idempotency key; a retry with the same key returns the existing ticket"
+            ),
+        ],
+        priority: Annotated[
+            str | None, Field(description="Ticket priority, e.g. high; omit for none")
+        ] = None,
+    ) -> TicketOutput:
+        return await _run(
+            lambda: TicketOutput(
+                ticket=world.create_ticket(
+                    ticket_id, title, priority, idempotency_key=idempotency_key
+                )
+            ),
+            is_replay=lambda: world.ticket_for_idempotency_key(idempotency_key) is not None,
+        )
 
     @server.tool(description="List all inventory items with availability.")
-    def get_inventory() -> InventoryOutput:
-        return InventoryOutput(items=world.get_inventory())
+    async def get_inventory() -> InventoryOutput:
+        return await _run(lambda: InventoryOutput(items=world.get_inventory()))
 
     @server.tool(description="Reserve one unit of an inventory item for an employee.")
-    def reserve_inventory(
+    async def reserve_inventory(
         item: Annotated[str, Field(description="Inventory item name, e.g. thinkpad-t14")],
         employee_id: Annotated[
             str, Field(description="Employee id making the reservation, e.g. alice")
         ],
     ) -> ReserveInventoryOutput:
-        try:
-            return ReserveInventoryOutput(item=world.reserve_inventory(item, employee_id))
-        except WorldError as err:
-            raise ToolError(str(err)) from err
+        return await _run(
+            lambda: ReserveInventoryOutput(item=world.reserve_inventory(item, employee_id))
+        )
 
     @server.tool(description="Deploy a service at a target version to an environment.")
-    def deploy_service(
+    async def deploy_service(
         service: Annotated[str, Field(description="Service name, e.g. checkout")],
         target_version: Annotated[str, Field(description="Version to deploy, e.g. 1.8.3")],
         environment: Annotated[
             str, Field(description="Target environment, e.g. staging or production")
         ],
     ) -> DeploymentOutput:
-        try:
-            return DeploymentOutput(
+        return await _run(
+            lambda: DeploymentOutput(
                 deployment=world.deploy_service(service, target_version, environment)
             )
-        except WorldError as err:
-            raise ToolError(str(err)) from err
+        )
 
     @server.tool(
         description=(
@@ -161,7 +202,7 @@ def create_server() -> FastMCP:
             "(SPEC.md §8 SCHEMA)."
         )
     )
-    def probe_schema(
+    async def probe_schema(
         string_field: str,
         int_field: int,
         float_field: float,
@@ -173,8 +214,8 @@ def create_server() -> FastMCP:
         nested_field: ProbeNestedObject,
         nested_list_field: list[ProbeNestedItem],
     ) -> ProbeSchemaOutput:
-        try:
-            return ProbeSchemaOutput(
+        return await _run(
+            lambda: ProbeSchemaOutput(
                 **world.probe_schema(
                     string_field=string_field,
                     int_field=int_field,
@@ -188,8 +229,7 @@ def create_server() -> FastMCP:
                     nested_list_field=nested_list_field,
                 )
             )
-        except WorldError as err:
-            raise ToolError(str(err)) from err
+        )
 
     @server.resource(
         DEPLOYMENT_POLICY_URI,

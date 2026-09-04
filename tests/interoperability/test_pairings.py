@@ -79,9 +79,10 @@ async def test_pairing(pairing: Pairing, tmp_path) -> None:
         f"{result.protocol_version_client}) — {result.error}"
     )
 
-    # discovery: the 6-tool contract on every pairing; resources + prompts
-    # asserted through the client surfaces that expose them
-    assert result.tools_seen == 6, _classified(result, "discovery: tools")
+    # discovery: the 7-tool contract on every pairing (M2.1 six + M2.3a
+    # create_ticket); resources + prompts asserted through the client
+    # surfaces that expose them
+    assert result.tools_seen == 7, _classified(result, "discovery: tools")
     if pairing.client_sdk == "adk":
         # Honest absence (M1 finding, SPEC.md §7): ADK's McpToolset has no
         # first-class resource/prompt surface, so the ADK client cannot

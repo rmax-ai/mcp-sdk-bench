@@ -20,6 +20,7 @@ from mcp_sdk_bench.servers.fastmcp.server import (
 EXPECTED_TOOLS = {
     "get_ticket",
     "update_ticket",
+    "create_ticket",
     "get_inventory",
     "reserve_inventory",
     "deploy_service",
@@ -37,7 +38,7 @@ def _text(result: types.CallToolResult) -> str:
     )
 
 
-async def test_tools_list_has_exactly_the_six_m21_tools() -> None:
+async def test_tools_list_has_exactly_the_seven_m23a_tools() -> None:
     async with _client() as client:
         tools = await client.list_tools()
         assert {tool.name for tool in tools} == EXPECTED_TOOLS

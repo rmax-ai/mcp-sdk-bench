@@ -99,7 +99,7 @@ async def run(server_sdk: str, log_file: Path) -> PairingResult:
         result.connected = True
         result.tools_seen = len(tools)
         # ADK client surface: tools only (M1 finding — no resource/prompt
-        # surface, so discovery_ok covers the 6-tool contract only).
+        # surface, so discovery_ok covers the 7-tool contract only).
         result.discovery_ok = {tool.name for tool in tools} == EXPECTED_TOOLS
         if not result.discovery_ok:
             result.error = f"discovery mismatch: tools={sorted(tool.name for tool in tools)}"

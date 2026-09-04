@@ -46,12 +46,14 @@ from typing import Any
 from mcp_sdk_bench.benchmark.result import LATEST_DIR, new_run_id
 from mcp_sdk_bench.benchmark.sweep import REPO_ROOT
 
-#: The M2.1 six-tool contract (mirrors tests/conformance/helpers.py
-#: EXPECTED_TOOLS — duplicated because src must not import from tests).
+#: The seven-tool contract (M2.1 six + M2.3a create_ticket, SPEC.md §21;
+#: mirrors tests/conformance/helpers.py EXPECTED_TOOLS — duplicated because
+#: src must not import from tests).
 EXPECTED_TOOLS = frozenset(
     {
         "get_ticket",
         "update_ticket",
+        "create_ticket",
         "get_inventory",
         "reserve_inventory",
         "deploy_service",

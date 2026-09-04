@@ -23,6 +23,7 @@ from mcp_sdk_bench.adapters.adk import AdkAdapter
 EXPECTED_TOOLS = {
     "get_ticket",
     "update_ticket",
+    "create_ticket",
     "get_inventory",
     "reserve_inventory",
     "deploy_service",
@@ -30,7 +31,7 @@ EXPECTED_TOOLS = {
 }
 
 
-async def test_adk_adapter_discovers_the_six_m21_tools() -> None:
+async def test_adk_adapter_discovers_the_seven_m23a_tools() -> None:
     adapter = AdkAdapter()
     try:
         discovery = await adapter.connect()

@@ -42,6 +42,10 @@ class Ticket(BaseModel):
     team: str = ""
     assignee: str | None = None
     description: str = ""
+    priority: str | None = None
+    #: Set only for tickets created via create_ticket (SPEC.md §21
+    #: idempotency); seeded fixture tickets have no key.
+    idempotency_key: str | None = None
 
 
 class Document(BaseModel):
@@ -112,6 +116,10 @@ class World(BaseModel):
     inventory: dict[str, InventoryItem] = Field(default_factory=dict)
     projects: dict[str, Project] = Field(default_factory=dict)
     op_log: list[OpRecord] = Field(default_factory=list)
+    #: idempotency_key -> ticket_id for tickets created via create_ticket
+    #: (SPEC.md §21). Populated on first execution only; a retry with a known
+    #: key is a replay and never creates a second ticket.
+    ticket_idempotency_keys: dict[str, str] = Field(default_factory=dict)
 
     # ---- mutation surface (single implementation shared by all server variants) ----
 
@@ -125,12 +133,51 @@ class World(BaseModel):
             raise WorldError(f"ticket {ticket_id} not found")
         return self.tickets[ticket_id]
 
-    def create_ticket(self, title: str, team: str, description: str = "") -> Ticket:
-        ticket_id = f"T-{len(self.op_log) + 1000}"
-        ticket = Ticket(id=ticket_id, title=title, status=TicketStatus.OPEN, team=team, description=description)
+    def create_ticket(
+        self,
+        ticket_id: str,
+        title: str,
+        priority: str | None = None,
+        *,
+        idempotency_key: str,
+    ) -> Ticket:
+        """Create a ticket with idempotency semantics (SPEC.md §21).
+
+        If `idempotency_key` was already used in this world session, return
+        the EXISTING ticket unchanged (no duplicate, no error, no op_log
+        entry) — a retried call must never create two tickets. Otherwise
+        create the ticket (status OPEN) and record the key.
+        """
+        if idempotency_key in self.ticket_idempotency_keys:
+            return self.tickets[self.ticket_idempotency_keys[idempotency_key]]
+        if ticket_id in self.tickets:
+            raise WorldError(f"ticket {ticket_id} already exists")
+        ticket = Ticket(
+            id=ticket_id,
+            title=title,
+            status=TicketStatus.OPEN,
+            priority=priority,
+            idempotency_key=idempotency_key,
+        )
         self.tickets[ticket_id] = ticket
-        self._record("create_ticket", "ticket", ticket_id, title=title, team=team)
+        self.ticket_idempotency_keys[idempotency_key] = ticket_id
+        self._record(
+            "create_ticket",
+            "ticket",
+            ticket_id,
+            title=title,
+            priority=priority,
+            idempotency_key=idempotency_key,
+        )
         return ticket
+
+    def ticket_for_idempotency_key(self, idempotency_key: str) -> Ticket | None:
+        """Return the ticket previously created under `idempotency_key`, or
+        None. This is how the fault layer and the tests tell a create_ticket
+        call that DID execute (side effect applied, key recorded) from a
+        rejected/replayed one."""
+        ticket_id = self.ticket_idempotency_keys.get(idempotency_key)
+        return self.tickets.get(ticket_id) if ticket_id is not None else None
 
     def update_ticket(
         self,

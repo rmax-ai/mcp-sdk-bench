@@ -11,13 +11,19 @@ Contents:
   (mirrors tests/conformance/test_official_server.py). The ADK factory yields
   the benchmark adapter (src/mcp_sdk_bench/adapters/adk.py): ADK 2.8 ships no
   standalone protocol client, so the adapter IS the canonical driving surface.
+- OFFICIAL_SESSION_FAULTY / FAST_MCP_SESSION_FAULTY (M2.3a, SPEC.md §21):
+  session factories that spawn the server subprocess WITH fault env vars
+  set (FAIL_TOOL_CALL, FAIL_PHASE, LATENCY_MS, TASK_FAILURE_RATE,
+  MALFORMED_RESPONSE_RATE, DROP_CONNECTION_AFTER, FAULT_SEED).
 - StdioProxy: a deterministic stdio JSON-RPC proxy with corrupt/delay/drop
   fault modes plus a "log" mode (M2.2) that passes frames through untouched
   while recording every JSON-RPC frame (both directions) to a JSONL file for
-  wire-level version-negotiation evidence. Run as a subprocess between client
-  and server. Wire-level faults apply only to the official and FastMCP
-  candidates; the ADK adapter drives its server through an SDK-managed
-  channel with no wire access.
+  wire-level version-negotiation evidence, and a "pass" mode (M2.3a) that
+  carries the env-driven probabilistic wire faults (MALFORMED_RESPONSE_RATE,
+  DROP_CONNECTION_AFTER, seeded by FAULT_SEED via mcp_sdk_bench.faults).
+  Run as a subprocess between client and server. Wire-level faults apply
+  only to the official and FastMCP candidates; the ADK adapter drives its
+  server through an SDK-managed channel with no wire access.
 
 This module doubles as the proxy executable:
     python tests/conformance/helpers.py --mode corrupt --nth 2 -- \
@@ -32,6 +38,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import os
 import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -44,6 +51,7 @@ from mcp.client.stdio import stdio_client
 
 from mcp_sdk_bench.adapters.adk import ADK_ENV_MESSAGE, AdkAdapter
 from mcp_sdk_bench.adapters.base import Discovery
+from mcp_sdk_bench.faults import FaultEngine, load_fault_config
 
 try:  # mcp 2.x (main env)
     from mcp.shared.exceptions import MCPError
@@ -66,11 +74,13 @@ INCIDENT_TRIAGE_PROMPT = "incident-triage"
 #: module must not be imported).
 INVALID_PARAMS = -32602
 
-#: The M2.1 six-tool contract: the five M1 world tools plus probe_schema.
+#: The seven-tool contract: the five M1 world tools plus probe_schema (M2.1)
+#: plus create_ticket (M2.3a, SPEC.md §21 idempotent creation).
 EXPECTED_TOOLS = frozenset(
     {
         "get_ticket",
         "update_ticket",
+        "create_ticket",
         "get_inventory",
         "reserve_inventory",
         "deploy_service",
@@ -154,9 +164,9 @@ def harness_issue(candidate: str, what: str) -> str:
     return f"HARNESS ISSUE [{candidate}]: {what}"
 
 
-# ---- stdio fault-injection proxy (SPEC.md §8 ERRORS / LIFECYCLE) ----
+# ---- stdio fault-injection proxy (SPEC.md §8 ERRORS / LIFECYCLE, §21 M2.3a) ----
 
-PROXY_MODES = ("corrupt", "delay", "drop", "log")
+PROXY_MODES = ("corrupt", "delay", "drop", "log", "pass")
 
 HELPERS_PATH = Path(__file__).resolve()
 
@@ -181,10 +191,22 @@ class ProxyFault:
         (flushed per line) to `log_file` as JSONL records of the form
         {"direction": "c2s"|"s2c", "frame": <parsed JSON-RPC frame>}.
         Required for the M2.2 version-negotiation wire evidence.
+    mode="pass": no CLI-triggered fault — pure passthrough. This is the
+        carrier for the M2.3a ENV-DRIVEN wire faults (SPEC.md §21): when the
+        proxy process env sets MALFORMED_RESPONSE_RATE, each tools/call
+        response frame is corrupted at that probability; when
+        DROP_CONNECTION_AFTER=N is set, the proxy exits after forwarding the
+        Nth tools/call response. Both use a FaultEngine seeded by FAULT_SEED,
+        so the same seed + same config + same call sequence produces the
+        identical fault sequence the in-process FaultEngine predicts.
 
     "Nth response frame" counts only server-to-client JSON-RPC responses
     (frames carrying "id" plus "result" or "error"); notifications and
-    requests are not counted. Counters are deterministic; no randomness.
+    requests are not counted. Counters are deterministic; no randomness in
+    the CLI modes. The ENV-driven faults deliberately count ONLY responses
+    to tools/call requests (tracked by request id), so the initialize
+    handshake and list_tools discovery are never faulted —
+    DROP_CONNECTION_AFTER=2 means the THIRD tool call hits a dead pipe.
     """
 
     mode: str
@@ -205,7 +227,14 @@ class StdioProxy:
     """Transparent newline-delimited JSON-RPC stdio proxy with deterministic
     fault injection. Runs as a subprocess between the candidate client and the
     real server child it spawns. Forwards stdin/stdout verbatim until the
-    configured trigger (see ProxyFault) fires."""
+    configured trigger (see ProxyFault) fires.
+
+    M2.3a (SPEC.md §21): on top of the CLI-selected mode, the proxy reads the
+    SAME fault env config as the in-process FaultEngine
+    (MALFORMED_RESPONSE_RATE / DROP_CONNECTION_AFTER / FAULT_SEED) and applies
+    those wire-level faults to tools/call responses only, via a FaultEngine
+    instance — identical seeds give identical fault sequences.
+    """
 
     def __init__(self, command: list[str], fault: ProxyFault) -> None:
         self.command = command
@@ -213,6 +242,10 @@ class StdioProxy:
         self.responses_seen = 0
         self._child: asyncio.subprocess.Process | None = None
         self._log: Any = None
+        #: ids of in-flight tools/call requests (for env-driven wire faults).
+        self._tool_call_ids: set[Any] = set()
+        self._tool_responses_seen = 0
+        self._env_engine: FaultEngine | None = None
 
     def _record(self, direction: str, line: bytes) -> None:
         """Log mode only: append one JSONL record per frame, flushed so the
@@ -239,6 +272,15 @@ class StdioProxy:
         )
 
     async def run(self) -> int:
+        # M2.3a env-driven wire faults (SPEC.md §21). The proxy process
+        # inherits the env the client spawned it with; the same vars also
+        # flow through to the server child (tool-level faults there).
+        env_config = load_fault_config()
+        if (
+            env_config.malformed_response_rate > 0
+            or env_config.drop_connection_after is not None
+        ):
+            self._env_engine = FaultEngine(env_config)
         if self.fault.mode == "log" and self.fault.log_file is not None:
             # Blocking open in an async def is deliberate: one short-lived
             # append handle per proxy process, opened before any frame flows.
@@ -278,6 +320,7 @@ class StdioProxy:
                 if not line:
                     break
                 self._record("c2s", line)
+                self._track_request(line)
                 stdin.write(line)
                 await stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
@@ -285,6 +328,18 @@ class StdioProxy:
         finally:
             with contextlib.suppress(BrokenPipeError, ConnectionResetError):
                 stdin.close()
+
+    def _track_request(self, line: bytes) -> None:
+        """Record the ids of tools/call requests so the env-driven wire
+        faults can target exactly their responses (never the handshake)."""
+        if self._env_engine is None:
+            return
+        try:
+            frame: Any = json.loads(line)
+        except ValueError:
+            return
+        if isinstance(frame, dict) and frame.get("method") == "tools/call" and "id" in frame:
+            self._tool_call_ids.add(frame["id"])
 
     async def _forward_responses(self) -> None:
         assert self._child is not None and self._child.stdout is not None
@@ -295,6 +350,10 @@ class StdioProxy:
                 return  # server exited on its own; pass EOF through by exiting
             self._record("s2c", line)
             is_response = self._is_response_frame(line)
+            is_tool_response = False
+            if is_response:
+                frame: Any = json.loads(line)
+                is_tool_response = frame.get("id") in self._tool_call_ids
             if is_response:
                 self.responses_seen += 1
                 if self.fault.mode == "delay":
@@ -304,10 +363,23 @@ class StdioProxy:
                     await asyncio.sleep(self.fault.delay_ms / 1000)
                 if self.fault.mode == "corrupt" and self.responses_seen == self.fault.nth:
                     line = CORRUPT_FRAME
+            # M2.3a env-driven wire faults (SPEC.md §21): tools/call
+            # responses only, seeded via FAULT_SEED.
+            if self._env_engine is not None and is_tool_response:
+                self._tool_responses_seen += 1
+                if self._env_engine.next_malformed():
+                    line = CORRUPT_FRAME
             out.write(line)
             out.flush()
             if self.fault.mode == "drop" and is_response and self.responses_seen == self.fault.nth:
                 return  # exit closes both pipes; run()'s finally kills the child
+            if (
+                self._env_engine is not None
+                and is_tool_response
+                and self._env_engine.drop_after() is not None
+                and self._tool_responses_seen == self._env_engine.drop_after()
+            ):
+                return  # DROP_CONNECTION_AFTER: exit closes both pipes
 
     async def _terminate_child(self) -> None:
         if self._child is None or self._child.returncode is not None:
@@ -420,6 +492,70 @@ async def FAST_MCP_SESSION(
 
 
 @asynccontextmanager
+async def OFFICIAL_SESSION_FAULTY(
+    *,
+    fault_env: dict[str, str],
+    fault: ProxyFault | None = None,
+    read_timeout_seconds: float | None = None,
+    message_handler: Callable[..., Any] | None = None,
+) -> AsyncIterator[ClientSession]:
+    """OFFICIAL_SESSION variant that spawns the server subprocess WITH fault
+    env vars set (SPEC.md §21). `fault_env` is merged over the current
+    environment: tool-level vars (FAIL_TOOL_CALL, FAIL_PHASE, LATENCY_MS,
+    TASK_FAILURE_RATE, FAULT_SEED) reach the server; wire-level vars
+    (MALFORMED_RESPONSE_RATE, DROP_CONNECTION_AFTER) reach the proxy. Pass
+    fault=ProxyFault(mode="pass") to route through the proxy when wire-level
+    faults are configured; with fault=None the server is spawned directly.
+    """
+    env = dict(os.environ)
+    env.update(fault_env)
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=proxy_args(OFFICIAL_SERVER_ARGS, fault),
+        env=env,
+    )
+    session_kwargs: dict[str, Any] = {}
+    if read_timeout_seconds is not None:
+        session_kwargs["read_timeout_seconds"] = read_timeout_seconds
+    if message_handler is not None:
+        session_kwargs["message_handler"] = message_handler
+    async with (
+        stdio_client(params) as (read_stream, write_stream),
+        ClientSession(read_stream, write_stream, **session_kwargs) as session,
+    ):
+        await session.initialize()
+        yield session
+
+
+@asynccontextmanager
+async def FAST_MCP_SESSION_FAULTY(
+    *,
+    fault_env: dict[str, str],
+    fault: ProxyFault | None = None,
+    message_handler: Callable[..., Any] | None = None,
+) -> AsyncIterator[Any]:
+    """FAST_MCP_SESSION variant that spawns the server subprocess WITH fault
+    env vars set (SPEC.md §21). Same env/proxy split as
+    OFFICIAL_SESSION_FAULTY."""
+    from fastmcp import Client
+    from fastmcp.client.transports import StdioTransport
+
+    env = dict(os.environ)
+    env.update(fault_env)
+    transport = StdioTransport(
+        command=sys.executable,
+        args=proxy_args(FASTMCP_SERVER_ARGS, fault),
+        env=env,
+        keep_alive=False,
+    )
+    client_kwargs: dict[str, Any] = {}
+    if message_handler is not None:
+        client_kwargs["message_handler"] = message_handler
+    async with Client(transport, **client_kwargs) as client:
+        yield client
+
+
+@asynccontextmanager
 async def ADK_ADAPTER_SESSION() -> AsyncIterator[tuple[AdkAdapter, Discovery]]:
     """The ADK candidate's canonical driving surface: the benchmark's
     AdkAdapter (ADK 2.8 ships no standalone protocol client). Yields
@@ -442,8 +578,8 @@ async def ADK_ADAPTER_SESSION() -> AsyncIterator[tuple[AdkAdapter, Discovery]]:
 def _main(argv: list[str]) -> int:
     if "--" not in argv:
         print(
-            "usage: helpers.py --mode {corrupt,delay,drop} [--nth N] [--delay-ms MS]"
-            " -- <server command...>",
+            "usage: helpers.py --mode {corrupt,delay,drop,log,pass} [--nth N]"
+            " [--delay-ms MS] [--log-file PATH] -- <server command...>",
             file=sys.stderr,
         )
         return 2
