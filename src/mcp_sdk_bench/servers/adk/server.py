@@ -4,7 +4,8 @@ The five world operations are defined as ADK-native ``FunctionTool`` objects
 (the exact tool objects an ADK agent calls) and hosted on an ``LlmAgent``.
 They are then exposed over MCP stdio with the M1 contract identical to the
 official-SDK variant: same 5 tools, same parameter names and field
-descriptions, same resource, same prompt.
+descriptions, same resource, same prompt. M2.1 adds a sixth FunctionTool,
+``probe_schema`` (SPEC.md §8 SCHEMA echo probe), registered the same way.
 
 Deviation note (recorded per AGENTS.md §5 honesty rules): ADK 2.8's only
 agent-as-MCP-server path is ``to_mcp_server`` in the private module
@@ -40,7 +41,8 @@ Smoke self-check (spawns the server over stdio, lists tools, exits 0):
 """
 from __future__ import annotations
 
-from typing import Annotated
+from enum import Enum
+from typing import Annotated, Any
 
 from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
@@ -51,6 +53,8 @@ from pydantic import BaseModel, Field
 from mcp_sdk_bench.world import (
     Deployment,
     InventoryItem,
+    ProbeNestedItem,
+    ProbeNestedObject,
     Ticket,
     TicketStatus,
     World,
@@ -89,6 +93,21 @@ class ReserveInventoryOutput(BaseModel):
 
 class DeploymentOutput(BaseModel):
     deployment: Deployment
+
+
+class ProbeSchemaOutput(BaseModel):
+    received: dict[str, Any]
+    count: int
+
+
+class SchemaEnum(str, Enum):
+    """Enum for probe_schema.enum_field (mirrors the FastMCP variant).
+    Verified against installed ADK 2.8.0: FunctionTool accepts a str-Enum
+    parameter and emits a $defs-referenced string enum schema."""
+
+    ALPHA = "alpha"
+    BETA = "beta"
+    GAMMA = "gamma"
 
 
 def _incident_triage_text(ticket_id: str) -> str:
@@ -167,9 +186,47 @@ def build_agent(world: World) -> LlmAgent:
         except WorldError as err:
             raise ToolError(str(err)) from err
 
+    def probe_schema(
+        string_field: str,
+        int_field: int,
+        float_field: float,
+        bool_field: bool,
+        enum_field: SchemaEnum,
+        nullable_field: str | None,
+        union_field: str | int,
+        list_field: list[str],
+        nested_field: ProbeNestedObject,
+        nested_list_field: list[ProbeNestedItem],
+    ) -> ProbeSchemaOutput:
+        """Side-effect-free echo probe exercising every JSON-schema primitive (SPEC.md §8 SCHEMA)."""
+        try:
+            return ProbeSchemaOutput(
+                **world.probe_schema(
+                    string_field=string_field,
+                    int_field=int_field,
+                    float_field=float_field,
+                    bool_field=bool_field,
+                    enum_field=enum_field.value,
+                    nullable_field=nullable_field,
+                    union_field=union_field,
+                    list_field=list_field,
+                    nested_field=nested_field,
+                    nested_list_field=nested_list_field,
+                )
+            )
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+
     tools = [
         FunctionTool(func=fn)
-        for fn in (get_ticket, update_ticket, get_inventory, reserve_inventory, deploy_service)
+        for fn in (
+            get_ticket,
+            update_ticket,
+            get_inventory,
+            reserve_inventory,
+            deploy_service,
+            probe_schema,
+        )
     ]
     return LlmAgent(
         name=AGENT_NAME,

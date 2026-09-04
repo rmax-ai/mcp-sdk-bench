@@ -29,6 +29,7 @@ EXPECTED_TOOLS = {
     "get_inventory",
     "reserve_inventory",
     "deploy_service",
+    "probe_schema",
 }
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -40,7 +41,7 @@ def _server_env() -> dict[str, str]:
     return env
 
 
-async def test_adk_mcptoolset_lists_the_five_m1_tools() -> None:
+async def test_adk_mcptoolset_lists_the_six_m21_tools() -> None:
     """McpToolset (ADK client) over stdio against the ADK-hosted server."""
     toolset = mcp_toolset.McpToolset(
         connection_params=mcp_toolset.StdioConnectionParams(

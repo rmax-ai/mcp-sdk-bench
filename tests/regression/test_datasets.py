@@ -17,13 +17,15 @@ DATASET_FILES = [
     REPO_ROOT / "datasets" / "composition.jsonl",
 ]
 
-# M1 5-tool contract plus the resource-read pseudo-tool (SPEC.md §6).
+# M2.1 6-tool contract (the five M1 world tools plus the §8 SCHEMA probe)
+# plus the resource-read pseudo-tool (SPEC.md §6).
 M1_CONTRACT_TOOLS = {
     "get_ticket",
     "update_ticket",
     "get_inventory",
     "reserve_inventory",
     "deploy_service",
+    "probe_schema",
 }
 ALLOWED_EXPECTED_TOOLS = M1_CONTRACT_TOOLS | {"read_resource"}
 

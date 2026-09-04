@@ -82,6 +82,28 @@ class WorldError(Exception):
     """Domain error raised by world mutations (mapped to MCP errors by servers)."""
 
 
+# ---- schema probe (SPEC.md §8 SCHEMA) ----
+
+#: Valid values for the probe's enum_field. Kept as data (not an Enum) so the
+#: world method signature stays ``enum_field: str``; each server variant maps
+#: this constraint onto its own schema mechanism.
+PROBE_SCHEMA_ENUM_VALUES: tuple[str, str, str] = ("alpha", "beta", "gamma")
+
+
+class ProbeNestedObject(BaseModel):
+    """Nested object shape for probe_schema.nested_field."""
+
+    id: str
+    tags: list[str]
+
+
+class ProbeNestedItem(BaseModel):
+    """Array element shape for probe_schema.nested_list_field."""
+
+    name: str
+    count: int
+
+
 class World(BaseModel):
     employees: dict[str, Employee] = Field(default_factory=dict)
     tickets: dict[str, Ticket] = Field(default_factory=dict)
@@ -159,6 +181,41 @@ class World(BaseModel):
         dep.status = DeploymentStatus.ACTIVE
         self._record("deploy_service", "deployment", service, version=target_version, environment=environment)
         return dep
+
+    def probe_schema(
+        self,
+        string_field: str,
+        int_field: int,
+        float_field: float,
+        bool_field: bool,
+        enum_field: str,
+        nullable_field: str | None,
+        union_field: str | int,
+        list_field: list[str],
+        nested_field: ProbeNestedObject,
+        nested_list_field: list[ProbeNestedItem],
+    ) -> dict[str, Any]:
+        """Side-effect-free echo probe exercising every JSON-schema primitive
+        the SPEC.md §8 SCHEMA category requires. NOT recorded in op_log (no
+        mutation), so it is safe for concurrency bursts. Returns a canonical
+        dict that must be identical across all three server variants."""
+        if enum_field not in PROBE_SCHEMA_ENUM_VALUES:
+            raise WorldError(
+                f"enum_field must be one of {list(PROBE_SCHEMA_ENUM_VALUES)}; got {enum_field!r}"
+            )
+        received: dict[str, Any] = {
+            "string_field": string_field,
+            "int_field": int_field,
+            "float_field": float_field,
+            "bool_field": bool_field,
+            "enum_field": enum_field,
+            "nullable_field": nullable_field,
+            "union_field": union_field,
+            "list_field": list_field,
+            "nested_field": nested_field.model_dump(mode="json"),
+            "nested_list_field": [item.model_dump(mode="json") for item in nested_list_field],
+        }
+        return {"received": received, "count": len(received)}
 
     def search_documents(self, query: str) -> list[Document]:
         q = query.lower()

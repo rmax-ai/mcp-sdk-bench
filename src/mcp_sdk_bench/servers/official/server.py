@@ -5,13 +5,14 @@ honestly represents the official SDK, not a fastmcp-style helper.
 
 M1 surface: 5 tools (get_ticket, update_ticket, get_inventory, reserve_inventory,
 deploy_service), 1 resource (company://policies/deployment), 1 prompt
-(incident-triage). One World instance per server process, seeded at startup;
-no disk persistence.
+(incident-triage). M2.1 adds probe_schema, a side-effect-free echo probe for
+the SPEC.md §8 SCHEMA conformance category. One World instance per server
+process, seeded at startup; no disk persistence.
 """
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
 
 from mcp import types
 from mcp.server.lowlevel import Server
@@ -20,8 +21,11 @@ from mcp.shared.exceptions import MCPError
 from pydantic import BaseModel, Field, ValidationError
 
 from mcp_sdk_bench.world import (
+    PROBE_SCHEMA_ENUM_VALUES,
     Deployment,
     InventoryItem,
+    ProbeNestedItem,
+    ProbeNestedObject,
     Ticket,
     TicketStatus,
     World,
@@ -72,6 +76,75 @@ class DeployServiceInput(BaseModel):
     environment: str = Field(description="Target environment, e.g. staging or production")
 
 
+# probe_schema is registered with an EXPLICIT inputSchema (not a pydantic-
+# generated one) so the wire schema states the §8 SCHEMA primitives exactly:
+# nullable as type ["string", "null"], union as type ["string", "integer"].
+# ProbeSchemaInput mirrors it and is the validation boundary inside
+# on_call_tool; the two must stay in lockstep.
+PROBE_SCHEMA_TOOL = "probe_schema"
+PROBE_SCHEMA_DESCRIPTION = (
+    "Side-effect-free echo probe exercising every JSON-schema primitive (SPEC.md §8 SCHEMA)."
+)
+
+PROBE_SCHEMA_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "string_field": {"type": "string"},
+        "int_field": {"type": "integer"},
+        "float_field": {"type": "number"},
+        "bool_field": {"type": "boolean"},
+        "enum_field": {"type": "string", "enum": list(PROBE_SCHEMA_ENUM_VALUES)},
+        "nullable_field": {"type": ["string", "null"]},
+        "union_field": {"type": ["string", "integer"]},
+        "list_field": {"type": "array", "items": {"type": "string"}},
+        "nested_field": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["id", "tags"],
+        },
+        "nested_list_field": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "count": {"type": "integer"},
+                },
+                "required": ["name", "count"],
+            },
+        },
+    },
+    "required": [
+        "string_field",
+        "int_field",
+        "float_field",
+        "bool_field",
+        "enum_field",
+        "nullable_field",
+        "union_field",
+        "list_field",
+        "nested_field",
+        "nested_list_field",
+    ],
+}
+
+
+class ProbeSchemaInput(BaseModel):
+    string_field: str
+    int_field: int
+    float_field: float
+    bool_field: bool
+    enum_field: Literal["alpha", "beta", "gamma"]
+    nullable_field: str | None
+    union_field: str | int
+    list_field: list[str]
+    nested_field: ProbeNestedObject
+    nested_list_field: list[ProbeNestedItem]
+
+
 # ---- tool output models (drive both structuredContent and outputSchema) ----
 
 
@@ -89,6 +162,11 @@ class ReserveInventoryOutput(BaseModel):
 
 class DeploymentOutput(BaseModel):
     deployment: Deployment
+
+
+class ProbeSchemaOutput(BaseModel):
+    received: dict[str, Any]
+    count: int
 
 
 def _incident_triage_text(ticket_id: str) -> str:
@@ -137,13 +215,21 @@ def create_server() -> Server[Any]:
     ) -> types.ListToolsResult:
         return types.ListToolsResult(
             tools=[
+                *(
+                    types.Tool(
+                        name=name,
+                        description=description,
+                        input_schema=input_model.model_json_schema(),
+                        output_schema=output_model.model_json_schema(),
+                    )
+                    for name, (description, input_model, output_model) in tool_specs.items()
+                ),
                 types.Tool(
-                    name=name,
-                    description=description,
-                    input_schema=input_model.model_json_schema(),
-                    output_schema=output_model.model_json_schema(),
-                )
-                for name, (description, input_model, output_model) in tool_specs.items()
+                    name=PROBE_SCHEMA_TOOL,
+                    description=PROBE_SCHEMA_DESCRIPTION,
+                    input_schema=PROBE_SCHEMA_INPUT_SCHEMA,
+                    output_schema=ProbeSchemaOutput.model_json_schema(),
+                ),
             ]
         )
 
@@ -160,9 +246,35 @@ def create_server() -> Server[Any]:
             is_error=True,
         )
 
+    def _call_probe(arguments: dict[str, Any] | None) -> types.CallToolResult:
+        try:
+            args = ProbeSchemaInput.model_validate(arguments or {})
+        except ValidationError as err:
+            raise MCPError(
+                INVALID_PARAMS, f"invalid arguments for {PROBE_SCHEMA_TOOL}: {err}"
+            ) from err
+        try:
+            echo = world.probe_schema(
+                string_field=args.string_field,
+                int_field=args.int_field,
+                float_field=args.float_field,
+                bool_field=args.bool_field,
+                enum_field=args.enum_field,
+                nullable_field=args.nullable_field,
+                union_field=args.union_field,
+                list_field=args.list_field,
+                nested_field=args.nested_field,
+                nested_list_field=args.nested_list_field,
+            )
+        except WorldError as err:
+            return _world_error(err)
+        return _ok(ProbeSchemaOutput(**echo))
+
     async def on_call_tool(
         _ctx: ServerRequestContext[Any], params: types.CallToolRequestParams
     ) -> types.CallToolResult:
+        if params.name == PROBE_SCHEMA_TOOL:
+            return _call_probe(params.arguments)
         spec = tool_specs.get(params.name)
         if spec is None:
             raise MCPError(INVALID_PARAMS, f"unknown tool {params.name}")

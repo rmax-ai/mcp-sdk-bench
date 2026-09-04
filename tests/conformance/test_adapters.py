@@ -21,6 +21,7 @@ EXPECTED_TOOLS = {
     "get_inventory",
     "reserve_inventory",
     "deploy_service",
+    "probe_schema",
 }
 DEPLOYMENT_POLICY_URI = "company://policies/deployment"
 INCIDENT_TRIAGE_PROMPT = "incident-triage"
@@ -39,7 +40,7 @@ async def _connected(cls: type[MCPAdapter]) -> AsyncIterator[tuple[MCPAdapter, D
 
 
 @pytest.mark.parametrize("cls", ADAPTER_CLASSES, ids=lambda c: c.__name__)
-async def test_discovery_five_tools_one_resource_one_prompt(cls) -> None:
+async def test_discovery_six_tools_one_resource_one_prompt(cls) -> None:
     async with _connected(cls) as (_, discovery):
         assert {tool.name for tool in discovery.tools} == EXPECTED_TOOLS
         assert DEPLOYMENT_POLICY_URI in {r.uri for r in discovery.resources}

@@ -8,13 +8,17 @@ descriptions, same resource, same prompt — only the framework differs.
 
 M1 surface: 5 tools (get_ticket, update_ticket, get_inventory,
 reserve_inventory, deploy_service), 1 resource (company://policies/deployment),
-1 prompt (incident-triage). One World instance per server process, seeded at
-startup; no disk persistence. WorldError surfaces as an MCP tool error
-(isError) carrying the WorldError message, via fastmcp.exceptions.ToolError.
+1 prompt (incident-triage). M2.1 adds probe_schema, a side-effect-free echo
+probe for the SPEC.md §8 SCHEMA conformance category (schema generated from
+the annotated signature; enum via the SchemaEnum class). One World instance
+per server process, seeded at startup; no disk persistence. WorldError
+surfaces as an MCP tool error (isError) carrying the WorldError message, via
+fastmcp.exceptions.ToolError.
 """
 from __future__ import annotations
 
-from typing import Annotated
+from enum import Enum
+from typing import Annotated, Any
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -23,6 +27,8 @@ from pydantic import BaseModel, Field
 from mcp_sdk_bench.world import (
     Deployment,
     InventoryItem,
+    ProbeNestedItem,
+    ProbeNestedObject,
     Ticket,
     TicketStatus,
     World,
@@ -55,6 +61,23 @@ class ReserveInventoryOutput(BaseModel):
 
 class DeploymentOutput(BaseModel):
     deployment: Deployment
+
+
+class ProbeSchemaOutput(BaseModel):
+    received: dict[str, Any]
+    count: int
+
+
+class SchemaEnum(str, Enum):
+    """Enum for probe_schema.enum_field; FastMCP generates the schema
+    constraint from this class (verified against installed FastMCP 4.0.2:
+    emits {"type": "string", "enum": [...]}, and nullable / union /
+    list-of-object fields all generate correct anyOf/object schemas — no
+    FastMCP 4 deviation to record for probe_schema)."""
+
+    ALPHA = "alpha"
+    BETA = "beta"
+    GAMMA = "gamma"
 
 
 def _incident_triage_text(ticket_id: str) -> str:
@@ -128,6 +151,42 @@ def create_server() -> FastMCP:
         try:
             return DeploymentOutput(
                 deployment=world.deploy_service(service, target_version, environment)
+            )
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+
+    @server.tool(
+        description=(
+            "Side-effect-free echo probe exercising every JSON-schema primitive "
+            "(SPEC.md §8 SCHEMA)."
+        )
+    )
+    def probe_schema(
+        string_field: str,
+        int_field: int,
+        float_field: float,
+        bool_field: bool,
+        enum_field: SchemaEnum,
+        nullable_field: str | None,
+        union_field: str | int,
+        list_field: list[str],
+        nested_field: ProbeNestedObject,
+        nested_list_field: list[ProbeNestedItem],
+    ) -> ProbeSchemaOutput:
+        try:
+            return ProbeSchemaOutput(
+                **world.probe_schema(
+                    string_field=string_field,
+                    int_field=int_field,
+                    float_field=float_field,
+                    bool_field=bool_field,
+                    enum_field=enum_field.value,
+                    nullable_field=nullable_field,
+                    union_field=union_field,
+                    list_field=list_field,
+                    nested_field=nested_field,
+                    nested_list_field=nested_list_field,
+                )
             )
         except WorldError as err:
             raise ToolError(str(err)) from err
