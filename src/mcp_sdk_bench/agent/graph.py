@@ -31,7 +31,13 @@ from mcp_sdk_bench.agent.simulator import (
     normalize_simulator_answer,
 )
 
-MAX_TOOL_ITERATIONS = 12
+#: Tool iterations per task. 24 since M3.3 (SPEC.md §9 H): a category-H run
+#: needs start + repeated polls (the simulated migration ticks 12 times at
+#: the default 2.0s pacing, ~24s) + the cancel/report turn, so the M1-era cap
+#: of 12 would structurally prevent an H task from ever observing the
+#: terminal view. The infinite-loop guard test (tests/regression) reads this
+#: constant, so it stays the single source of truth.
+MAX_TOOL_ITERATIONS = 24
 
 
 class AgentState(TypedDict):
@@ -216,6 +222,19 @@ def build_agent(
                             )
                         )
                     )
+            # M3.3 (SPEC.md §9 H): the category-H post-tool-result hook. The
+            # scripted user observes each tool result the agent sees; under
+            # the cancel-at-progress policy this injects the user's
+            # "Actually — cancel the migration." exactly once (the message
+            # rides the same user-side channel as elicitation answers, so it
+            # lands AFTER the ToolMessages and counts as one user
+            # interaction).
+            observe_text = await simulator.observe_tool_result(
+                name, result.structured_content, result.text
+            )
+            if observe_text:
+                user_interactions += 1
+                user_messages.append(HumanMessage(content=f"User message: {observe_text}"))
             latency_ms += (time.perf_counter() - start) * 1000
             out_calls.append({"name": name, "arguments": call["args"]})
             content = (

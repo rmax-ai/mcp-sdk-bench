@@ -46,10 +46,12 @@ from typing import Any
 from mcp_sdk_bench.benchmark.result import LATEST_DIR, new_run_id
 from mcp_sdk_bench.benchmark.sweep import REPO_ROOT
 
-#: The ten-tool contract (M2.1 six + M2.3a create_ticket + M3.2
-#: generate_monthly_report/get_report_task/cancel_report_task, SPEC.md §21;
+#: The thirteen-tool contract (M2.1 six + M2.3a create_ticket + M3.2 three
+#: report task tools + M3.3 three migration tools, SPEC.md §21/§9 H;
 #: mirrors tests/conformance/helpers.py EXPECTED_TOOLS — duplicated because
-#: src must not import from tests).
+#: src must not import from tests). Every milestone that adds agent-visible
+#: tools extends this set additively; discovery assertions are exact-set
+#: equality, so a server exposing fewer or more tools is an SDK defect.
 EXPECTED_TOOLS = frozenset(
     {
         "get_ticket",
@@ -62,6 +64,9 @@ EXPECTED_TOOLS = frozenset(
         "generate_monthly_report",
         "get_report_task",
         "cancel_report_task",
+        "start_migration",
+        "get_migration_status",
+        "cancel_migration",
     }
 )
 

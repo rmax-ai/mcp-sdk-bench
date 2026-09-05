@@ -29,6 +29,9 @@ EXPECTED_TOOLS = {
     "generate_monthly_report",
     "get_report_task",
     "cancel_report_task",
+    "start_migration",
+    "get_migration_status",
+    "cancel_migration",
 }
 
 SERVER_PARAMS = StdioServerParameters(
@@ -52,7 +55,7 @@ def _text(result: types.CallToolResult) -> str:
     )
 
 
-async def test_tools_list_has_exactly_the_ten_m32_tools() -> None:
+async def test_tools_list_has_exactly_the_thirteen_tools() -> None:
     async for session in _connect():
         tools = await session.list_tools()
         assert {tool.name for tool in tools.tools} == EXPECTED_TOOLS

@@ -29,7 +29,32 @@ Notification seam (mirrors the elicitation seam): the WORLD owns the policy
 poll — and only when that client opted in); the SERVER VARIANT owns the
 protocol mechanics behind ``set_task_update_hook`` (official: wire
 ``notifications/progress`` + ``notifications/tasks/status``; fastmcp/adk: no
-hook, app-level polling only)."""
+hook, app-level polling only).
+
+M3.3 (SPEC.md §9 H category H long-running + §10): the same registry gains a
+MIGRATION task kind (``start_migration(scope)`` -> handle ``migrate-<seq>``)
+for the category-H customer-data migration scenario. Migrations share the
+report vocabulary and machinery: same status enum/terminal set, same
+asyncio runner + tick pacing (``MCP_BENCH_TASK_TICK_S``), same cancellation
+semantics, same ``FaultEngine.task_failure()`` draw at start, and the SAME
+combined concurrency limit (``MAX_ACTIVE_TASKS`` = 2 across BOTH kinds — a
+running report + a running migration exhaust the limit). Migrations advance
+through three deterministic phases (preparing -> copying -> validating,
+``migration_phase_for_progress``) mapped onto 12 progress ticks (1/12 .. 1.0;
+~24s at the 2.0s default pacing) and finish with the terminal result
+``{migration_id, rows, completed_at}``. Registry records for both kinds
+persist with the world store and the asyncio runners are process-local
+(``_ensure_task_runners`` re-spawns whichever records a fresh process finds).
+
+Deterministic h-03 failure lane (SPEC.md §9 H, dataset longrunning.jsonl):
+in ADDITION to the FaultEngine draw, a migration started with
+scope == CANARY_MIGRATION_SCOPE ("canary") ALWAYS fails at its first
+progress tick with the canonical ``INJECTED_TASK_FAILURE`` message. The
+canary lane is part of the simulated scenario (a known-bad migration in the
+world's data), not a magic env var — documented here and in the dataset row.
+The protocol tasks/* handlers (official variant) and the plain migration
+mirror tools resolve BOTH task kinds, because the world registry is the
+single source of truth for every handle ("report-…" / "migrate-…")."""
 from __future__ import annotations
 
 import asyncio
@@ -37,7 +62,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel, Field, PrivateAttr
 
@@ -144,12 +169,15 @@ ELICIT_APPROVAL = "approval"
 DEPLOYMENT_DECLINED = "deployment declined by user"
 
 
-# ---- report task registry (SPEC.md §17, M3.2) ----
+# ---- world task registry (SPEC.md §17 report tasks, M3.2; §9 H migrations, M3.3) ----
 
-#: Canonical world statuses for a report task. The MCP wire Task.status
-#: vocabulary (working/input_required/completed/failed/cancelled) has no
-#: queued/running split; server variants map queued+running to "working" and
-#: carry the world status in statusMessage (see servers/official/server.py).
+#: Canonical world statuses for a registered task. This is the world's ONE
+#: task-status vocabulary (queued/running/completed/failed/cancelled),
+#: shared by the report kind (SPEC.md §17) and the migration kind
+#: (SPEC.md §9 H, M3.3). The MCP wire Task.status vocabulary
+#: (working/input_required/completed/failed/cancelled) has no queued/running
+#: split; server variants map queued+running to "working" and carry the
+#: world status in statusMessage (see servers/official/server.py).
 class ReportTaskStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -158,11 +186,16 @@ class ReportTaskStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
-#: Terminal states: a task in one of these never ticks again and cannot be
-#: cancelled.
+#: Terminal states (both task kinds): a task in one of these never ticks
+#: again and cannot be cancelled.
 REPORT_TASK_TERMINAL: frozenset[ReportTaskStatus] = frozenset(
     {ReportTaskStatus.COMPLETED, ReportTaskStatus.FAILED, ReportTaskStatus.CANCELLED}
 )
+
+#: Handle prefixes minted by the world registry (canonical single source —
+#: adapters import these to dispatch app-level poll/cancel tools by kind).
+REPORT_TASK_PREFIX = "report-"
+MIGRATION_TASK_PREFIX = "migrate-"
 
 #: Progress steps of the simulated monthly-report task (SPEC.md §17): ticks
 #: advance 0.2 at a time until 1.0 == completed.
@@ -170,15 +203,51 @@ REPORT_TASK_PROGRESS_STEPS: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0)
 
 #: Default seconds between progress ticks. Tests and the CLI override via
 #: MCP_BENCH_TASK_TICK_S to keep the hermetic suite fast; the nominal
-#: 15-second report of SPEC.md §17 maps to the default pacing.
+#: 15-second report of SPEC.md §17 and the ~24-second migration of SPEC.md
+#: §9 H map to the default pacing.
 DEFAULT_TASK_TICK_S = 2.0
 
 #: The registry supports exactly two concurrently active (queued/running)
-#: tasks; a third start is rejected with WorldError.
-MAX_ACTIVE_REPORT_TASKS = 2
+#: tasks ACROSS BOTH KINDS (M3.3: a running report and a running migration
+#: share the limit — documented decision; per-kind limits would silently
+#: double the concurrent-tick load on the 2-core benchmark host). A third
+#: start of either kind is rejected with WorldError.
+MAX_ACTIVE_TASKS = 2
+#: Backwards-compatible alias (M3.2 name kept for exports); the limit is now
+#: shared across task kinds, so prefer MAX_ACTIVE_TASKS.
+MAX_ACTIVE_REPORT_TASKS = MAX_ACTIVE_TASKS
 
 #: Deterministic row count of the simulated report.
 REPORT_ROWS = 1200
+
+# ---- migration task kind (M3.3, SPEC.md §9 H) ----
+
+#: Fixed scope that deterministically FAILS the migration at its first
+#: progress tick (the h-03 lane in datasets/longrunning.jsonl). Part of the
+#: simulated scenario, not an env var.
+CANARY_MIGRATION_SCOPE = "canary"
+
+#: Shared tool-field guidance for start_migration's `scope` argument
+#: (identical text on all three server variants, SPEC.md §23 — it names the
+#: deterministic scopes the category-H dataset uses: "customer-data" for
+#: h-01/h-02, "canary" for h-03).
+MIGRATION_SCOPE_DESCRIPTION = (
+    "Which dataset to migrate, e.g. 'customer-data'; the special scope "
+    "'canary' is a known-bad migration that fails deterministically"
+)
+
+#: Migration phase vocabulary, mapped onto progress 0.0..1.0 by
+#: migration_phase_for_progress.
+MIGRATION_PHASE_PREPARING = "preparing"
+MIGRATION_PHASE_COPYING = "copying"
+MIGRATION_PHASE_VALIDATING = "validating"
+
+#: The simulated customer-data migration advances 1/12 per tick (12 ticks x
+#: the tick pacing => ~24s at the 2.0s default); 1.0 == completed.
+MIGRATION_PROGRESS_STEPS: tuple[float, ...] = tuple(n / 12 for n in range(1, 13))
+
+#: Deterministic row count of the simulated customer-data migration.
+MIGRATION_ROWS = 4800
 
 #: Fixed TTL (ms) stamped on wire Task objects. The mcp 2.1.1 wire types
 #: REQUIRE the ttl key (no default) and the session dump strips None, so a
@@ -233,6 +302,55 @@ def report_task_view(task: ReportTask) -> ReportTaskView:
         progress=task.progress,
         result=task.result,
         error=task.error,
+    )
+
+
+def migration_phase_for_progress(progress: float) -> str:
+    """Deterministic phase label for a migration's progress value (M3.3):
+    preparing up to 1/3, copying up to 2/3, validating beyond that. 1.0 is
+    terminal (completed) and carries no phase."""
+    if progress <= 1 / 3:
+        return MIGRATION_PHASE_PREPARING
+    if progress <= 2 / 3:
+        return MIGRATION_PHASE_COPYING
+    return MIGRATION_PHASE_VALIDATING
+
+
+class MigrationTask(ReportTask):
+    """One registered migration task (M3.3, SPEC.md §9 H). Same fields as a
+    report task plus the scope that started it (persisted with the world
+    store; the canary scope is how the deterministic h-03 failure lane is
+    identified after a process restart)."""
+
+    scope: str = ""
+
+
+class MigrationTaskView(BaseModel):
+    """The SDK-agnostic migration-task view shared by all three server
+    variants' structured output. Same envelope as ReportTaskView plus the
+    deterministic phase label (preparing/copying/validating) while the task
+    is queued/running; terminal tasks carry phase None."""
+
+    handle: str
+    status: str
+    progress: float
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    phase: str | None = None
+
+
+def migration_task_view(task: MigrationTask) -> MigrationTaskView:
+    return MigrationTaskView(
+        handle=task.handle,
+        status=task.status.value,
+        progress=task.progress,
+        result=task.result,
+        error=task.error,
+        phase=(
+            migration_phase_for_progress(task.progress)
+            if task.status not in REPORT_TASK_TERMINAL
+            else None
+        ),
     )
 
 
@@ -350,6 +468,12 @@ class World(BaseModel):
     #: Monotonic handle counter (persisted; handles stay unique across
     #: restarts sharing one world store).
     report_task_seq: int = 0
+    #: M3.3 migration task registry (SPEC.md §9 H): handle -> task record.
+    #: Same persistence semantics as report_tasks; the two registries share
+    #: MAX_ACTIVE_TASKS and the process-local runner map.
+    migration_tasks: dict[str, MigrationTask] = Field(default_factory=dict)
+    #: Monotonic migration handle counter (persisted).
+    migration_task_seq: int = 0
 
     # ---- process-local task runtime (never serialized) ----
     _task_runners: dict[str, asyncio.Task[None]] = PrivateAttr(default_factory=dict)
@@ -569,7 +693,7 @@ class World(BaseModel):
             raise WorldError(f"unknown employee {employee_id}")
         return self.employees[employee_id]
 
-    # ---- report task registry (SPEC.md §17, M3.2) ----
+    # ---- world task registry (SPEC.md §17 report kind M3.2; §9 H migration kind M3.3) ----
 
     def set_task_runtime(
         self,
@@ -579,7 +703,8 @@ class World(BaseModel):
     ) -> None:
         """Per-process runtime configuration, called once by the server
         variant at startup. `update_hook` is the notification seam: invoked
-        (awaited) after every task transition; None for variants without a
+        (awaited) after every task transition of EITHER kind (both record
+        types subclass ReportTask); None for variants without a
         server-pushed notification surface (fastmcp/adk)."""
         self._task_tick_s = tick_s
         self._task_update_hook = update_hook
@@ -593,17 +718,43 @@ class World(BaseModel):
         if self._state_file is not None:
             self._state_file.write_text(self.model_dump_json())
 
+    def _task_kind_of(self, handle: str) -> str:
+        """Registry kind implied by a handle's prefix (canonical: the world
+        mints report-… and migrate-… handles only)."""
+        return "migration" if handle.startswith(MIGRATION_TASK_PREFIX) else "report"
+
+    def _iter_tasks(self, kind: str = "any"):
+        """Iterate registry records: kind in {"report", "migration", "any"}
+        (reports first for "any", so tasks/list order is deterministic)."""
+        if kind in ("report", "any"):
+            yield from self.report_tasks.values()
+        if kind in ("migration", "any"):
+            yield from self.migration_tasks.values()
+
+    def _lookup(self, handle: str, kind: str) -> ReportTask | None:
+        """Direct registry lookup for one kind or both ("any"); returns None
+        for an unknown handle. Does NOT ensure runners (register_task_session
+        needs the raw record mid-start)."""
+        if kind in ("report", "any"):
+            record = self.report_tasks.get(handle)
+            if record is not None:
+                return record
+        if kind in ("migration", "any"):
+            return self.migration_tasks.get(handle)
+        return None
+
     def register_task_session(self, handle: str, session: Any) -> None:
         """Bind the notification target for `handle` to `session` and mark the
         task opted in (world policy: the client that started the task — or
         re-bound it with an opt-in poll — receives its notifications).
 
-        Direct dict lookup, NOT get_report_task: this runs mid-start before
+        Direct dict lookup (NOT find_task): this can run mid-start before
         the runner is registered, and _ensure_task_runners would spawn a
         duplicate runner for the not-yet-registered handle."""
-        if handle not in self.report_tasks:
-            raise WorldError(f"report task {handle} not found")
-        self.report_tasks[handle].notify_opt_in = True
+        record = self._lookup(handle, "any")
+        if record is None:
+            raise WorldError(f"task {handle} not found")
+        record.notify_opt_in = True
         self._task_sessions[handle] = session
 
     def task_session(self, handle: str) -> Any | None:
@@ -611,10 +762,10 @@ class World(BaseModel):
 
     def _ensure_task_runners(self) -> None:
         """Lazily (re)spawn asyncio runners for persisted queued/running
-        tasks. Called from every task registry method, so a fresh server
-        process sharing the world store resumes its tasks on the first
-        task-related call — create_server() itself may run outside an event
-        loop (fastmcp variant), hence lazy rather than at construction."""
+        tasks of EITHER kind. Called from every task registry method, so a
+        fresh server process sharing the world store resumes its tasks on the
+        first task-related call — create_server() itself may run outside an
+        event loop (fastmcp variant), hence lazy rather than at construction."""
         for task in self.report_tasks.values():
             if task.status not in REPORT_TASK_TERMINAL and (
                 task.handle not in self._task_runners or self._task_runners[task.handle].done()
@@ -622,6 +773,27 @@ class World(BaseModel):
                 self._task_runners[task.handle] = asyncio.create_task(
                     self._run_report_task(task.handle)
                 )
+        for task in self.migration_tasks.values():
+            if task.status not in REPORT_TASK_TERMINAL and (
+                task.handle not in self._task_runners or self._task_runners[task.handle].done()
+            ):
+                self._task_runners[task.handle] = asyncio.create_task(
+                    self._run_migration_task(task.handle)
+                )
+
+    def _active_task_count(self) -> int:
+        """Queued/running tasks across BOTH registries (the shared
+        MAX_ACTIVE_TASKS concurrency limit, M3.3)."""
+        return sum(
+            1 for task in self._iter_tasks("any") if task.status not in REPORT_TASK_TERMINAL
+        )
+
+    def _check_can_start(self, kind_label: str) -> None:
+        if self._active_task_count() >= MAX_ACTIVE_TASKS:
+            raise WorldError(
+                f"{kind_label} task limit reached ({MAX_ACTIVE_TASKS} concurrent "
+                "report/migration tasks)"
+            )
 
     async def start_report_task(
         self, fault_engine: Any, *, session: Any | None = None
@@ -631,23 +803,17 @@ class World(BaseModel):
         Draws ``fault_engine.task_failure()`` ONCE here (deterministic per
         seed); when it fires the task fails asynchronously at its first
         progress tick with the canonical injected-task-failure message. At
-        most MAX_ACTIVE_REPORT_TASKS tasks may be active concurrently; a
-        third start raises WorldError.
+        most MAX_ACTIVE_TASKS tasks may be active concurrently across BOTH
+        kinds; an additional start raises WorldError.
         """
         # Deferred import: faults.py imports this module (no import cycle).
         from mcp_sdk_bench.faults import INJECTED_TASK_FAILURE
 
         self._ensure_task_runners()
-        active = [
-            t for t in self.report_tasks.values() if t.status not in REPORT_TASK_TERMINAL
-        ]
-        if len(active) >= MAX_ACTIVE_REPORT_TASKS:
-            raise WorldError(
-                f"report task limit reached ({MAX_ACTIVE_REPORT_TASKS} concurrent tasks)"
-            )
+        self._check_can_start("report")
         will_fail = fault_engine.task_failure()
         self.report_task_seq += 1
-        handle = f"report-{self.report_task_seq:03d}"
+        handle = f"{REPORT_TASK_PREFIX}{self.report_task_seq:03d}"
         task = ReportTask(
             handle=handle,
             status=ReportTaskStatus.QUEUED,
@@ -675,13 +841,101 @@ class World(BaseModel):
         return list(self.report_tasks.values())
 
     async def cancel_report_task(self, handle: str) -> ReportTask:
-        """Cancel a queued/running task: the ticker stops, no result is ever
-        produced. Cancelling a terminal task raises WorldError."""
+        """Cancel a queued/running REPORT task: the ticker stops, no result
+        is ever produced. Cancelling a terminal task raises WorldError."""
         task = self.get_report_task(handle)
+        return await self._cancel_record(task)
+
+    def find_task(self, handle: str) -> ReportTask:
+        """Kind-agnostic registry lookup (M3.3: the official protocol
+        tasks/* handlers resolve BOTH report and migration handles through
+        this — regression-proven in tests/tasks). Unknown handle -> WorldError
+        with a generic message."""
+        self._ensure_task_runners()
+        record = self._lookup(handle, "any")
+        if record is None:
+            raise WorldError(f"task {handle} not found")
+        return record
+
+    def list_tasks(self) -> list[ReportTask]:
+        """All registered tasks of both kinds (reports first — deterministic
+        ordering), for the official protocol tasks/list handler."""
+        self._ensure_task_runners()
+        return list(self._iter_tasks("any"))
+
+    async def cancel_task(self, handle: str) -> ReportTask:
+        """Kind-agnostic cancellation (protocol tasks/cancel semantics):
+        cancels whichever registry owns `handle`."""
+        task = self.find_task(handle)
+        return await self._cancel_record(task)
+
+    async def start_migration(
+        self, scope: str, fault_engine: Any, *, session: Any | None = None
+    ) -> MigrationTask:
+        """Register a simulated customer-data migration (M3.3, SPEC.md §9 H).
+
+        Mirrors start_report_task: one FaultEngine.task_failure() draw at
+        start, asynchronous mid-task failure at the first progress tick when
+        it fires, MAX_ACTIVE_TASKS shared with the report kind. ADDITIONALLY
+        the deterministic h-03 lane: scope == CANARY_MIGRATION_SCOPE forces
+        will_fail True regardless of the draw (the canary migration is known
+        bad in the simulated world — datasets/longrunning.jsonl h-03).
+        Async for parity with start_report_task (registration awaits nothing).
+        Returns the task record; the runner is spawned before returning.
+        """
+        # Deferred import: faults.py imports this module (no import cycle).
+        from mcp_sdk_bench.faults import INJECTED_TASK_FAILURE
+
+        self._ensure_task_runners()
+        self._check_can_start("migration")
+        will_fail = fault_engine.task_failure() or scope == CANARY_MIGRATION_SCOPE
+        self.migration_task_seq += 1
+        handle = f"{MIGRATION_TASK_PREFIX}{self.migration_task_seq:03d}"
+        task = MigrationTask(
+            handle=handle,
+            status=ReportTaskStatus.QUEUED,
+            will_fail=will_fail,
+            scope=scope,
+            created_seq=len(self.op_log),
+            updated_seq=len(self.op_log),
+        )
+        self.migration_tasks[handle] = task
+        self._record_task(task, "start", injected_failure_message=INJECTED_TASK_FAILURE)
+        # Spawn the runner BEFORE any other registry call so
+        # _ensure_task_runners never double-spawns this handle.
+        self._task_runners[handle] = asyncio.create_task(self._run_migration_task(handle))
+        if session is not None:
+            self.register_task_session(handle, session)
+        return task
+
+    def get_migration_task(self, handle: str) -> MigrationTask:
+        self._ensure_task_runners()
+        if handle not in self.migration_tasks:
+            raise WorldError(f"migration task {handle} not found")
+        return self.migration_tasks[handle]
+
+    def list_migration_tasks(self) -> list[MigrationTask]:
+        self._ensure_task_runners()
+        return list(self.migration_tasks.values())
+
+    async def cancel_migration_task(self, handle: str) -> MigrationTask:
+        """Cancel a queued/running MIGRATION task: the ticker stops, no
+        result is ever produced. Cancelling a terminal task raises
+        WorldError."""
+        task = self.get_migration_task(handle)
+        # _cancel_record is shared with the report kind (ReportTask return);
+        # the caller already resolved the MIGRATION record, so narrow here.
+        return cast(MigrationTask, await self._cancel_record(task))
+
+    async def _cancel_record(self, task: ReportTask) -> ReportTask:
+        """Shared cancellation: mark CANCELLED, stop the asyncio runner,
+        record + persist. Callers resolve the record per kind first (so an
+        unknown handle raises a kind-appropriate error before this runs)."""
         if task.status in REPORT_TASK_TERMINAL:
-            raise WorldError(f"report task {handle} is already {task.status.value}")
+            kind = self._task_kind_of(task.handle)
+            raise WorldError(f"{kind} task {task.handle} is already {task.status.value}")
         task.status = ReportTaskStatus.CANCELLED
-        runner = self._task_runners.pop(handle, None)
+        runner = self._task_runners.pop(task.handle, None)
         if runner is not None:
             runner.cancel()
         self._record_task(task, "cancel")
@@ -689,9 +943,10 @@ class World(BaseModel):
 
     def _record_task(self, task: ReportTask, event: str, **extra: Any) -> None:
         task.updated_seq = len(self.op_log)
+        kind = self._task_kind_of(task.handle)
         self._record(
-            f"report_task_{event}",
-            "report_task",
+            f"{kind}_task_{event}",
+            f"{kind}_task",
             task.handle,
             status=task.status.value,
             progress=task.progress,
@@ -706,10 +961,11 @@ class World(BaseModel):
             await hook(task)
 
     async def _run_report_task(self, handle: str) -> None:
-        """The ticker: QUEUED -> RUNNING, then one progress step per tick;
-        completes at 1.0. A will_fail task fails at its FIRST progress tick
-        (the M3.2 asynchronous injected failure). Cancellation is delivered
-        by cancel_report_task, which sets the status before cancelling."""
+        """The report ticker: QUEUED -> RUNNING, then one progress step per
+        tick; completes at 1.0. A will_fail task fails at its FIRST progress
+        tick (the M3.2 asynchronous injected failure). Cancellation is
+        delivered by cancel_report_task, which sets the status before
+        cancelling."""
         from mcp_sdk_bench.faults import INJECTED_TASK_FAILURE
 
         task = self.report_tasks[handle]
@@ -741,4 +997,44 @@ class World(BaseModel):
                 await self._notify_task(task)
         except asyncio.CancelledError:
             # cancel_report_task already set the terminal status.
+            return
+
+    async def _run_migration_task(self, handle: str) -> None:
+        """The migration ticker (M3.3, SPEC.md §9 H): QUEUED -> RUNNING, then
+        1/12 progress per tick through the preparing -> copying -> validating
+        phases; completes at 1.0 with {migration_id, rows, completed_at}. A
+        will_fail task (FaultEngine draw, or the deterministic canary lane)
+        fails at its FIRST progress tick. Cancellation is delivered by
+        cancel_migration_task, which sets the status before cancelling."""
+        from mcp_sdk_bench.faults import INJECTED_TASK_FAILURE
+
+        task = self.migration_tasks[handle]
+        try:
+            if task.status == ReportTaskStatus.QUEUED:
+                task.status = ReportTaskStatus.RUNNING
+                self._record_task(task, "running")
+                await self._notify_task(task)
+            for step in MIGRATION_PROGRESS_STEPS[task.tick :]:
+                await asyncio.sleep(self._task_tick_s)
+                if task.will_fail and task.tick == 0:
+                    task.status = ReportTaskStatus.FAILED
+                    task.error = INJECTED_TASK_FAILURE
+                    self._record_task(task, "fail")
+                    await self._notify_task(task)
+                    return
+                task.tick += 1
+                task.progress = step
+                if step >= 1.0:
+                    task.status = ReportTaskStatus.COMPLETED
+                    task.result = {
+                        "migration_id": f"customer-data-{handle}",
+                        "rows": MIGRATION_ROWS,
+                        "completed_at": task_timestamp(task.updated_seq),
+                    }
+                    self._record_task(task, "complete")
+                else:
+                    self._record_task(task, "tick")
+                await self._notify_task(task)
+        except asyncio.CancelledError:
+            # cancel_migration_task already set the terminal status.
             return

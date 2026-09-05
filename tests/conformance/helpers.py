@@ -74,11 +74,16 @@ INCIDENT_TRIAGE_PROMPT = "incident-triage"
 #: module must not be imported).
 INVALID_PARAMS = -32602
 
-#: The ten-tool contract: the five M1 world tools plus probe_schema (M2.1)
-#: plus create_ticket (M2.3a, SPEC.md §21 idempotent creation) plus the three
-#: M3.2 task tools (SPEC.md §17: generate_monthly_report / get_report_task /
-#: cancel_report_task — identical surface on all three variants; the official
-#: variant additionally serves the protocol tasks/* methods).
+#: The thirteen-tool contract (additive growth since M2.1): the five M1
+#: world tools plus probe_schema (M2.1) plus create_ticket (M2.3a, SPEC.md
+#: §21 idempotent creation) plus the three M3.2 task tools (SPEC.md §17:
+#: generate_monthly_report / get_report_task / cancel_report_task) plus the
+#: three M3.3 migration tools (SPEC.md §9 H: start_migration /
+#: get_migration_status / cancel_migration) — identical surface on all three
+#: variants; the official variant additionally serves the protocol tasks/*
+#: methods. Discovery assertions stay exact-set equality (a server exposing
+#: MORE or FEWER tools than the contract is an SDK defect), so every
+#: milestone that adds agent-visible tools extends this set additively.
 EXPECTED_TOOLS = frozenset(
     {
         "get_ticket",
@@ -91,6 +96,9 @@ EXPECTED_TOOLS = frozenset(
         "generate_monthly_report",
         "get_report_task",
         "cancel_report_task",
+        "start_migration",
+        "get_migration_status",
+        "cancel_migration",
     }
 )
 

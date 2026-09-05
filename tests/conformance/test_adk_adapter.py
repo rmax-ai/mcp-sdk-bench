@@ -31,10 +31,13 @@ EXPECTED_TOOLS = {
     "generate_monthly_report",
     "get_report_task",
     "cancel_report_task",
+    "start_migration",
+    "get_migration_status",
+    "cancel_migration",
 }
 
 
-async def test_adk_adapter_discovers_the_ten_m32_tools() -> None:
+async def test_adk_adapter_discovers_the_thirteen_m33_tools() -> None:
     adapter = AdkAdapter()
     try:
         discovery = await adapter.connect()

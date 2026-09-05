@@ -17,11 +17,14 @@ objects whose .raw_mcp_tool is an mcp 1.x Tool (camelCase .inputSchema);
 McpTool.run_async(args=..., tool_context=...) returns the CallToolResult as a
 dict with camelCase keys (isError, structuredContent, content).
 
-M3.2 (SPEC.md §17): this adapter exercises the APP-LEVEL task surface —
-mcp 1.x has no Tasks wire surface on the serving path and McpToolset has
-no task client API — so start/poll/cancel map to the plain tools
-generate_monthly_report / get_report_task / cancel_report_task, classified
-as app-level in docs/capability-matrix.md. The framework-native equivalent
+M3.2 (SPEC.md §17) + M3.3 (SPEC.md §9 H): this adapter exercises the
+APP-LEVEL task surface — mcp 1.x has no Tasks wire surface on the serving
+path and McpToolset has no task client API — so start/poll/cancel map to
+the plain tools: report kind generate_monthly_report / get_report_task /
+cancel_report_task, migration kind start_migration / get_migration_status /
+cancel_migration (the poll/cancel tool is picked from the handle's kind
+prefix — "migrate-…" routes to the migration tools), classified as
+app-level in docs/capability-matrix.md. The framework-native equivalent
 (ADK 2.8.0 ``LongRunningFunctionTool``, verified in envs/adk) lives outside
 MCP and is deliberately not wired in (SPEC.md §23).
 """
@@ -33,11 +36,15 @@ from pathlib import Path
 from typing import Any
 
 from mcp_sdk_bench.adapters.base import (
+    MIGRATION_CANCEL_TOOL,
+    MIGRATION_POLL_TOOL,
     Discovery,
     MCPAdapter,
     TaskView,
     ToolResult,
     ToolSpec,
+    is_migration_handle,
+    resolve_start_tool,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -181,7 +188,7 @@ class AdkAdapter(MCPAdapter):
             text=text or None,
         )
 
-    # ---- M3.2 app-level task tools (SPEC.md §17) — NOT protocol tasks ----
+    # ---- app-level task tools (SPEC.md §17 M3.2 report / §9 H M3.3 migration) — NOT protocol tasks ----
 
     async def _task_call(self, name: str, arguments: dict) -> TaskView:
         result = await self.call_tool(name, arguments)
@@ -189,17 +196,23 @@ class AdkAdapter(MCPAdapter):
             raise RuntimeError(result.text or f"{name} failed")
         return TaskView(**result.structured_content["task"])
 
-    async def start_task(self, name: str) -> TaskView:
-        """Plain tool call on generate_monthly_report (app-level layer)."""
-        return await self._task_call(name, {})
+    async def start_task(self, name: str, arguments: dict | None = None) -> TaskView:
+        """Plain tool call on the app-level start tool for the requested
+        kind: generate_monthly_report (report) or start_migration (migration,
+        with ``arguments={"scope": ...}``)."""
+        return await self._task_call(resolve_start_tool(name), dict(arguments or {}))
 
     async def poll_task(self, handle: str) -> TaskView:
-        """Plain tool call on get_report_task (app-level layer)."""
-        return await self._task_call("get_report_task", {"handle": handle})
+        """Plain tool call on get_migration_status for a migration handle,
+        else get_report_task (app-level layer)."""
+        poll_tool = MIGRATION_POLL_TOOL if is_migration_handle(handle) else "get_report_task"
+        return await self._task_call(poll_tool, {"handle": handle})
 
     async def cancel_task(self, handle: str) -> TaskView:
-        """Plain tool call on cancel_report_task (app-level layer)."""
-        return await self._task_call("cancel_report_task", {"handle": handle})
+        """Plain tool call on cancel_migration for a migration handle, else
+        cancel_report_task (app-level layer)."""
+        cancel_tool = MIGRATION_CANCEL_TOOL if is_migration_handle(handle) else "cancel_report_task"
+        return await self._task_call(cancel_tool, {"handle": handle})
 
     async def read_resource(self, uri: str) -> str:
         raise RuntimeError(RESOURCE_GAP)

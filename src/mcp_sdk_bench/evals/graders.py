@@ -5,6 +5,14 @@ state, and answer checks are all exact, reproducible comparisons. Trajectory
 correctness is reported independently of task_success (§11 outcome vs
 trajectory separation). grade_task never raises — a malformed result grades
 0 and carries an "error" field, so one bad result cannot kill a sweep.
+
+M3.3 (SPEC.md §9 H): category-H rows grade the migration world state from
+the run's tool-call log, exactly like the deployment kind (M2.3b
+convention — there is no read-back tool for migrations other than the
+polling view the run itself produced, and per-task world isolation makes the
+last observed terminal view the observable final state). Check id
+"migration:terminal" compares fields against that view; dotted keys descend
+into the completed task's `result` payload (e.g. "result.rows": 4800).
 """
 from __future__ import annotations
 
@@ -18,6 +26,16 @@ from mcp_sdk_bench.world.fixtures import seed_world
 # (see benchmark.runner.AccessRecordingAdapter). They are excluded from the
 # tool-selection comparison but their arguments are still graded.
 PSEUDO_TOOLS = frozenset({"read_resource", "get_prompt"})
+
+#: M3.3 (SPEC.md §9 H): the app-level migration tool surface shared by all
+#: three variants (also reachable through the official protocol tasks/*
+#: handlers). Successful results carry the task view
+#: {"task": {handle, status, progress, result, error, phase}}.
+_MIGRATION_TOOLS = frozenset({"start_migration", "get_migration_status", "cancel_migration"})
+
+#: Sentinel distinguishing "field absent from the entity" from a JSON null
+#: (a null-valued field is a legitimate expected value, e.g. result == null).
+_MISSING = object()
 
 
 def _used_names(result: dict) -> list[str]:
@@ -87,6 +105,38 @@ def _deployment_from_call_log(service: str, call_log: list[dict]) -> dict | None
     return entity
 
 
+def _migration_views_from_call_log(call_log: list[dict]) -> list[dict]:
+    """The migration task views the run observed, in call order (M3.3,
+    SPEC.md §9 H). Every successful migration-tool result carries the view
+    envelope {"task": {handle, status, progress, ...}}; failed/errored calls
+    carry no view and are skipped."""
+    views: list[dict] = []
+    for entry in call_log:
+        if entry.get("is_error") or entry.get("elicitation_request"):
+            continue
+        if entry.get("name") not in _MIGRATION_TOOLS:
+            continue
+        structured = entry.get("structured_content")
+        if not isinstance(structured, dict):
+            continue
+        view = structured.get("task")
+        if isinstance(view, dict):
+            views.append(view)
+    return views
+
+
+def _field_value(entity: dict, field: str) -> Any:
+    """Value of `field` against a task view; dotted keys descend into
+    nested dicts (the completed migration's `result` payload). Returns the
+    _MISSING sentinel when the path is absent."""
+    value: Any = entity
+    for part in field.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return _MISSING
+        value = value[part]
+    return value
+
+
 async def _correct_final_state(task: dict, result: dict, adapter: MCPAdapter) -> float:
     for check_id, fields in task["expected_final_state"].items():
         kind, _, key = check_id.partition(":")
@@ -113,6 +163,14 @@ async def _correct_final_state(task: dict, result: dict, adapter: MCPAdapter) ->
                 if entity is None:
                     seeded = seed_world().deployments.get(key)
                     entity = seeded.model_dump(mode="json") if seeded is not None else None
+            elif kind == "migration":
+                # M3.3 (SPEC.md §9 H): the migration world state as observed
+                # by the run — the LAST successful migration-tool view. The
+                # agent can only truthfully report a terminal outcome after
+                # observing it, so this check enforces both the world state
+                # AND that the agent actually polled to the terminal view.
+                views = _migration_views_from_call_log(result.get("tool_call_log") or [])
+                entity = views[-1] if views else None
             else:
                 return 0.0
         except Exception:  # noqa: BLE001 — any adapter error fails the check, never the grader
@@ -120,7 +178,8 @@ async def _correct_final_state(task: dict, result: dict, adapter: MCPAdapter) ->
         if not isinstance(entity, dict):
             return 0.0
         for field, expected_value in fields.items():
-            if _plain(entity.get(field)) != expected_value:
+            observed = _field_value(entity, field)
+            if observed is _MISSING or _plain(observed) != expected_value:
                 return 0.0
     return 1.0
 

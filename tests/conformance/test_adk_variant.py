@@ -34,6 +34,9 @@ EXPECTED_TOOLS = {
     "generate_monthly_report",
     "get_report_task",
     "cancel_report_task",
+    "start_migration",
+    "get_migration_status",
+    "cancel_migration",
 }
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -45,7 +48,7 @@ def _server_env() -> dict[str, str]:
     return env
 
 
-async def test_adk_mcptoolset_lists_the_ten_m32_tools() -> None:
+async def test_adk_mcptoolset_lists_the_thirteen_m33_tools() -> None:
     """McpToolset (ADK client) over stdio against the ADK-hosted server."""
     toolset = mcp_toolset.McpToolset(
         connection_params=mcp_toolset.StdioConnectionParams(

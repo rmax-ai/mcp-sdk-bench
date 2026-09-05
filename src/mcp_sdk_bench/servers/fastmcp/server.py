@@ -44,6 +44,13 @@ Like the official variant's task mirrors, they bypass run_tool_with_faults
 by design: the M3.2 fault story is the world's asynchronous mid-task
 failure (one FaultEngine.task_failure() draw at task start, applied at the
 first progress tick), not a synchronous call failure.
+
+M3.3 (SPEC.md §9 H category H) adds the MIGRATION task kind to the SAME
+world registry, again as APP-LEVEL plain tools (start_migration(scope) /
+get_migration_status(handle) / cancel_migration(handle)) — FastMCP 4.0.2
+has no server-pushed task-notification surface, so migration progress is
+poll-only (same app-level classification; scope "canary" is the
+deterministic h-03 failure lane — see the world docstring).
 """
 from __future__ import annotations
 
@@ -65,10 +72,12 @@ from mcp_sdk_bench.faults import (
     run_tool_with_faults,
 )
 from mcp_sdk_bench.world import (
+    MIGRATION_SCOPE_DESCRIPTION,
     Deployment,
     ElicitationUnavailable,
     ElicitFn,
     InventoryItem,
+    MigrationTaskView,
     ProbeNestedItem,
     ProbeNestedObject,
     ReportTaskView,
@@ -78,6 +87,7 @@ from mcp_sdk_bench.world import (
     WorldError,
     elicitation_response,
     load_task_tick_s,
+    migration_task_view,
     report_task_view,
     reset_world,
 )
@@ -174,6 +184,13 @@ class ReportTaskOutput(BaseModel):
     """M3.2 app-level task view envelope (identical across variants)."""
 
     task: ReportTaskView
+
+
+class MigrationTaskOutput(BaseModel):
+    """M3.3 app-level migration-task view envelope (identical across
+    variants): the report envelope plus the phase label."""
+
+    task: MigrationTaskView
 
 
 class SchemaEnum(str, Enum):
@@ -432,6 +449,62 @@ def create_server() -> FastMCP:
         except WorldError as err:
             raise ToolError(str(err)) from err
         return ReportTaskOutput(task=report_task_view(task))
+
+    @server.tool(
+        description=(
+            "Start a long-running customer-data migration for the given "
+            "scope; returns the task handle, initial status, and progress. "
+            "Poll get_migration_status until it completes. App-level "
+            "equivalent of MCP Tasks (FastMCP 4.0.2 has no protocol Tasks "
+            "surface) — SPEC.md §9 H."
+        )
+    )
+    async def start_migration(
+        scope: Annotated[str, Field(description=MIGRATION_SCOPE_DESCRIPTION)],
+    ) -> MigrationTaskOutput:
+        # Bypasses the synchronous fault layer by design (module docstring);
+        # the migration fault story is the world's asynchronous mid-task
+        # failure (the scope == "canary" lane is deterministic).
+        try:
+            task = await world.start_migration(scope, fault_engine)
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+        return MigrationTaskOutput(task=migration_task_view(task))
+
+    @server.tool(
+        description=(
+            "Poll a migration task by handle; returns status, progress, the "
+            "current phase, and the result or error once the task is terminal "
+            "(app-level equivalent of tasks/get — SPEC.md §9 H)."
+        )
+    )
+    async def get_migration_status(
+        handle: Annotated[
+            str, Field(description="Migration task handle returned by start_migration")
+        ],
+    ) -> MigrationTaskOutput:
+        try:
+            task = world.get_migration_task(handle)
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+        return MigrationTaskOutput(task=migration_task_view(task))
+
+    @server.tool(
+        description=(
+            "Cancel a running migration task by handle (app-level equivalent "
+            "of tasks/cancel — SPEC.md §9 H)."
+        )
+    )
+    async def cancel_migration(
+        handle: Annotated[
+            str, Field(description="Migration task handle returned by start_migration")
+        ],
+    ) -> MigrationTaskOutput:
+        try:
+            task = await world.cancel_migration_task(handle)
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+        return MigrationTaskOutput(task=migration_task_view(task))
 
     @server.resource(
         DEPLOYMENT_POLICY_URI,

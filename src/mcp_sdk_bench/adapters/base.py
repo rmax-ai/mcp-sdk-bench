@@ -13,6 +13,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+from mcp_sdk_bench.world.state import MIGRATION_TASK_PREFIX
+
 
 class ToolSpec(BaseModel):
     name: str
@@ -50,19 +52,60 @@ class Discovery(BaseModel):
 
 
 class TaskView(BaseModel):
-    """SDK-agnostic view of one report task (SPEC.md §17, M3.2).
+    """SDK-agnostic view of one registered task (SPEC.md §17 report kind M3.2,
+    SPEC.md §9 H migration kind M3.3).
 
     `status` uses the WORLD vocabulary (queued/running/completed/failed/
     cancelled); the official adapter maps the wire Task.status ("working")
     back to it. `progress` is 0.0..1.0. `result` carries the completed
-    task's payload ({"report_id", "rows", "generated_at"}); `error` the
-    failure message."""
+    task's payload — {"report_id", "rows", "generated_at"} for reports,
+    {"migration_id", "rows", "completed_at"} for migrations; `error` the
+    failure message. Migration handles start with ``migrate-`` and report
+    handles with ``report-`` (canonical prefixes in world/state.py)."""
 
     handle: str
     status: str
     progress: float = 0.0
     result: dict | None = None
     error: str | None = None
+
+
+#: The variant-shared app-level task tools (SPEC.md §23 identical surface).
+#: Report kind (M3.2): generate_monthly_report / get_report_task /
+#: cancel_report_task. Migration kind (M3.3): start_migration /
+#: get_migration_status / cancel_migration.
+REPORT_START_TOOL = "generate_monthly_report"
+MIGRATION_START_TOOL = "start_migration"
+MIGRATION_POLL_TOOL = "get_migration_status"
+MIGRATION_CANCEL_TOOL = "cancel_migration"
+
+
+def resolve_start_tool(name: str) -> str:
+    """Map a start_task() `name` argument to the wire tool name.
+
+    Accepts both the kind token ("report" | "migration") and the app-level
+    start-tool name (generate_monthly_report | start_migration) so the M3.2
+    adapter tests and the M3.3 migration tests share one surface. Unknown
+    names fail loud rather than silently dispatching a bogus tool call.
+    """
+    resolved = {
+        "report": REPORT_START_TOOL,
+        REPORT_START_TOOL: REPORT_START_TOOL,
+        "migration": MIGRATION_START_TOOL,
+        MIGRATION_START_TOOL: MIGRATION_START_TOOL,
+    }.get(name)
+    if resolved is None:
+        raise ValueError(
+            f"unknown task start name {name!r} (expected 'report' | "
+            f"'migration' | {REPORT_START_TOOL} | {MIGRATION_START_TOOL})"
+        )
+    return resolved
+
+
+def is_migration_handle(handle: str) -> bool:
+    """True when a task handle belongs to the migration kind. The canonical
+    prefixes are minted by the world registry (world/state.py)."""
+    return handle.startswith(MIGRATION_TASK_PREFIX)
 
 
 class MCPAdapter(ABC):
@@ -111,35 +154,48 @@ class MCPAdapter(ABC):
             f"{type(self).__name__} has no protocol elicitation surface"
         )
 
-    async def start_task(self, name: str) -> TaskView:
-        """Start the named long-running task and return its initial view
-        (SPEC.md §17, M3.2).
+    async def start_task(self, name: str, arguments: dict | None = None) -> TaskView:
+        """Start a long-running task and return its initial view (SPEC.md
+        §17, M3.2; SPEC.md §9 H, M3.3).
+
+        `name` is the task kind token OR the variant's app-level start-tool
+        name: ``"report"`` / ``"generate_monthly_report"`` start the
+        monthly-report task; ``"migration"`` / ``"start_migration"`` start a
+        customer-data migration with ``arguments={"scope": ...}`` (the
+        world's migration scenario; scope "canary" is the deterministic
+        failure lane). Both spellings are accepted so the M3.2 adapter tests
+        (which pass the report tool name) and the M3.3 migration tests (which
+        pass the kind token) share one surface.
 
         Layering contract (the honesty that feeds the capability matrix):
         the OFFICIAL adapter exercises the real MCP Tasks protocol surface
         (tools/call returning CreateTaskResult semantics, protocol
         tasks/get | tasks/cancel | tasks/list, server-pushed
-        notifications/progress + notifications/tasks/status); the FASTMCP
-        and ADK adapters exercise APP-LEVEL plain tools
-        (generate_monthly_report / get_report_task / cancel_report_task)
-        because neither SDK ships a Tasks surface. Each adapter's docstring
-        states which layer it drives. Raises RuntimeError when the server
-        rejects the start (e.g. the 2-concurrent-task limit)."""
+        notifications/progress + notifications/tasks/status) for BOTH task
+        kinds; the FASTMCP and ADK adapters exercise APP-LEVEL plain tools
+        (report: generate_monthly_report / get_report_task /
+        cancel_report_task; migration: start_migration / get_migration_status
+        / cancel_migration) because neither SDK ships a Tasks surface. Each
+        adapter's docstring states which layer it drives. Raises RuntimeError
+        when the server rejects the start (e.g. the 2-concurrent-task limit,
+        shared across kinds)."""
         raise NotImplementedError(
             f"{type(self).__name__} has no task surface (protocol or app-level)"
         )
 
     async def poll_task(self, handle: str) -> TaskView:
-        """Poll one task. Official: a real tasks/get request, with
-        server-pushed progress merged in; fastmcp/adk: the get_report_task
-        plain tool."""
+        """Poll one task (report or migration handle). Official: a real
+        tasks/get request, with server-pushed progress merged in; fastmcp/
+        adk: the get_report_task / get_migration_status plain tool, selected
+        by the handle's kind prefix."""
         raise NotImplementedError(
             f"{type(self).__name__} has no task surface (protocol or app-level)"
         )
 
     async def cancel_task(self, handle: str) -> TaskView:
-        """Cancel one task. Official: a real tasks/cancel request;
-        fastmcp/adk: the cancel_report_task plain tool."""
+        """Cancel one task (report or migration handle). Official: a real
+        tasks/cancel request; fastmcp/adk: the cancel_report_task /
+        cancel_migration plain tool, selected by the handle's kind prefix."""
         raise NotImplementedError(
             f"{type(self).__name__} has no task surface (protocol or app-level)"
         )

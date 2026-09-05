@@ -66,6 +66,13 @@ design: the M3.2 fault story is the world's asynchronous mid-task failure
 (one FaultEngine.task_failure() draw at task start, applied at the first
 progress tick).
 
+M3.3 (SPEC.md §9 H category H) adds the MIGRATION task kind to the SAME
+world registry, again as APP-LEVEL plain tools (start_migration(scope) /
+get_migration_status(handle) / cancel_migration(handle)) — the mcp 1.x
+serving path has no server-pushed task-notification surface either, so
+migration progress is poll-only (same app-level classification; scope
+"canary" is the deterministic h-03 failure lane — see the world docstring).
+
 This module runs only in the ADK env. From the repo root:
 
     PYTHONPATH=src uv run --project envs/adk python -m mcp_sdk_bench.servers.adk
@@ -94,8 +101,10 @@ from mcp_sdk_bench.faults import (
     run_tool_with_faults,
 )
 from mcp_sdk_bench.world import (
+    MIGRATION_SCOPE_DESCRIPTION,
     Deployment,
     InventoryItem,
+    MigrationTaskView,
     ProbeNestedItem,
     ProbeNestedObject,
     ReportTaskView,
@@ -104,6 +113,7 @@ from mcp_sdk_bench.world import (
     World,
     WorldError,
     load_task_tick_s,
+    migration_task_view,
     report_task_view,
     reset_world,
 )
@@ -150,6 +160,13 @@ class ReportTaskOutput(BaseModel):
     """M3.2 app-level task view envelope (identical across variants)."""
 
     task: ReportTaskView
+
+
+class MigrationTaskOutput(BaseModel):
+    """M3.3 app-level migration-task view envelope (identical across
+    variants): the report envelope plus the phase label."""
+
+    task: MigrationTaskView
 
 
 class SchemaEnum(str, Enum):
@@ -370,6 +387,43 @@ def build_agent(world: World) -> LlmAgent:
             raise ToolError(str(err)) from err
         return ReportTaskOutput(task=report_task_view(task))
 
+    async def start_migration(
+        scope: Annotated[str, Field(description=MIGRATION_SCOPE_DESCRIPTION)],
+    ) -> MigrationTaskOutput:
+        """Start a long-running customer-data migration for the given scope; returns the task handle, initial status, and progress. Poll get_migration_status until it completes (app-level task equivalent, SPEC.md §9 H)."""
+        # Bypasses the synchronous fault layer by design (module docstring);
+        # the migration fault story is the world's asynchronous mid-task
+        # failure (the scope == "canary" lane is deterministic).
+        try:
+            task = await world.start_migration(scope, fault_engine)
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+        return MigrationTaskOutput(task=migration_task_view(task))
+
+    async def get_migration_status(
+        handle: Annotated[
+            str, Field(description="Migration task handle returned by start_migration")
+        ],
+    ) -> MigrationTaskOutput:
+        """Poll a migration task by handle; returns status, progress, the current phase, and the result or error once the task is terminal (app-level tasks/get equivalent, SPEC.md §9 H)."""
+        try:
+            task = world.get_migration_task(handle)
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+        return MigrationTaskOutput(task=migration_task_view(task))
+
+    async def cancel_migration(
+        handle: Annotated[
+            str, Field(description="Migration task handle returned by start_migration")
+        ],
+    ) -> MigrationTaskOutput:
+        """Cancel a running migration task by handle (app-level tasks/cancel equivalent, SPEC.md §9 H)."""
+        try:
+            task = await world.cancel_migration_task(handle)
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+        return MigrationTaskOutput(task=migration_task_view(task))
+
     tools = [
         FunctionTool(func=fn)
         for fn in (
@@ -383,6 +437,9 @@ def build_agent(world: World) -> LlmAgent:
             generate_monthly_report,
             get_report_task,
             cancel_report_task,
+            start_migration,
+            get_migration_status,
+            cancel_migration,
         )
     ]
     return LlmAgent(

@@ -1,4 +1,5 @@
-"""ADK Tasks lifecycle (SPEC.md §17, M3.2) — ADK env only.
+"""ADK Tasks lifecycle (SPEC.md §17 report kind M3.2, §9 H migration kind
+M3.3) — ADK env only.
 
 Skips in the main env (mcp 2.x) like the other ADK modules. Run it for real
 with:
@@ -7,9 +8,10 @@ with:
 
 The ADK variant exercises the APP-LEVEL task surface (plain tools
 generate_monthly_report / get_report_task / cancel_report_task over the
-McpToolset channel); mcp 1.x has no protocol Tasks wire surface and
-McpToolset no task client API — classified as app-level, never protocol
-tasks (docs/capability-matrix.md).
+McpToolset channel, plus the M3.3 migration tools start_migration /
+get_migration_status / cancel_migration); mcp 1.x has no protocol Tasks wire
+surface and McpToolset no task client API — classified as app-level, never
+protocol tasks (docs/capability-matrix.md).
 
 Env-var configuration (tick pacing, fault rate, world store) goes through
 os.environ because AdkAdapter forwards the parent environment to its server
@@ -154,3 +156,79 @@ async def test_adk_long_running_tool_native_not_wired() -> None:
     import), but the benchmark variant deliberately does NOT wire it —
     tasks here are the app-level MCP tool equivalent (SPEC.md §23)."""
     from google.adk.tools import LongRunningFunctionTool  # noqa: F401
+
+
+# ---- M3.3 migration kind (SPEC.md §9 H): same app-level surface ----
+
+MIGRATION_RESULT_ROWS = 4800
+
+
+async def _start_adk_migration(adapter: AdkAdapter, scope: str = "customer-data") -> TaskView:
+    started = await adapter.start_task("migration", {"scope": scope})
+    assert started.handle.startswith("migrate-"), started.handle
+    assert started.status in ("queued", "running")
+    assert started.progress == 0.0
+    return started
+
+
+async def test_adk_migration_start_poll_to_completion() -> None:
+    adapter = AdkAdapter()
+    try:
+        await adapter.connect()
+        started = await _start_adk_migration(adapter, "customer-data")
+
+        views = await _poll_until_terminal(adapter, started.handle)
+        final = views[-1]
+        assert final.status == "completed"
+        assert final.progress == 1.0
+        assert final.error is None
+        assert final.result is not None
+        assert final.result["migration_id"].startswith("customer-data-migrate-")
+        assert final.result["rows"] == MIGRATION_RESULT_ROWS
+        assert "completed_at" in final.result
+        progresses = [v.progress for v in views]
+        assert progresses == sorted(progresses)
+    finally:
+        await adapter.close()
+
+
+async def test_adk_migration_cancel_mid_run() -> None:
+    adapter = AdkAdapter()
+    try:
+        await adapter.connect()
+        started = await _start_adk_migration(adapter)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 10.0
+        while True:
+            view = await adapter.poll_task(started.handle)
+            if view.status == "running" and view.progress > 0.0:
+                break
+            assert loop.time() < deadline, "migration never started ticking"
+
+        cancelled = await adapter.cancel_task(started.handle)
+        assert cancelled.status == "cancelled"
+        assert cancelled.result is None
+
+        await asyncio.sleep(0.2)  # several ticks: a live ticker would advance
+        after = await adapter.poll_task(started.handle)
+        assert after.status == "cancelled"
+        assert after.progress == cancelled.progress
+        assert after.result is None
+    finally:
+        await adapter.close()
+
+
+async def test_adk_migration_canary_scope_fails() -> None:
+    """The deterministic h-03 lane (scope == "canary") fails at the first
+    progress tick with the canonical injected-task-failure message."""
+    adapter = AdkAdapter()
+    try:
+        await adapter.connect()
+        started = await _start_adk_migration(adapter, "canary")
+
+        views = await _poll_until_terminal(adapter, started.handle)
+        assert views[-1].status == "failed"
+        assert views[-1].error == INJECTED_TASK_FAILURE
+        assert views[-1].result is None
+    finally:
+        await adapter.close()

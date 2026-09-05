@@ -58,11 +58,22 @@ TaskStatusNotification, ServerTasksCapability). This variant therefore:
     a `tasks` field but Server.get_capabilities never populates it — set
     explicitly).
 
-Fault-layer note: the three task tools BYPASS run_tool_with_faults. M3.2
+Fault-layer note: the task tools BYPASS run_tool_with_faults. M3.2
 failure injection is the world's ASYNCHRONOUS mid-task failure (one
 FaultEngine.task_failure() draw at task start, applied at the first
 progress tick); the synchronous per-call fault layer would instead fail the
 start/poll calls themselves, which is not the SPEC.md §17 experiment.
+
+M3.3 (SPEC.md §9 H category H) adds the MIGRATION task kind to the same
+world registry: three more plain tools (start_migration(scope) /
+get_migration_status(handle) / cancel_migration(handle)) mirror the report
+tools, and the protocol tasks/* handlers (a)+(b)+(c) above are GENERALIZED
+to serve both task kinds — the registry is the single source of truth for
+every handle ("report-…" report tasks, "migrate-…" migrations), so
+tasks/get, tasks/cancel, tasks/list and tasks/result resolve a migration
+handle exactly as they resolve a report handle. A migration started with
+scope "canary" deterministically fails at its first progress tick (the
+h-03 lane in datasets/longrunning.jsonl); see the world docstring.
 """
 from __future__ import annotations
 
@@ -85,12 +96,15 @@ from mcp_sdk_bench.faults import (
     run_tool_with_faults,
 )
 from mcp_sdk_bench.world import (
+    MIGRATION_SCOPE_DESCRIPTION,
     PROBE_SCHEMA_ENUM_VALUES,
     REPORT_TASK_TTL_MS,
     Deployment,
     ElicitationUnavailable,
     ElicitFn,
     InventoryItem,
+    MigrationTask,
+    MigrationTaskView,
     ProbeNestedItem,
     ProbeNestedObject,
     ReportTask,
@@ -102,6 +116,7 @@ from mcp_sdk_bench.world import (
     WorldError,
     elicitation_response,
     load_task_tick_s,
+    migration_task_view,
     report_task_view,
     reset_world,
     task_timestamp,
@@ -240,18 +255,35 @@ class ProbeSchemaInput(BaseModel):
     nested_list_field: list[ProbeNestedItem]
 
 
-# ---- M3.2 task tools (SPEC.md §17) ----
+# ---- task tools (SPEC.md §17 report kind M3.2; §9 H migration kind M3.3) ----
 
 GENERATE_REPORT_TOOL = "generate_monthly_report"
 GET_REPORT_TASK_TOOL = "get_report_task"
 CANCEL_REPORT_TASK_TOOL = "cancel_report_task"
+START_MIGRATION_TOOL = "start_migration"
+GET_MIGRATION_STATUS_TOOL = "get_migration_status"
+CANCEL_MIGRATION_TOOL = "cancel_migration"
 
+#: The migration tool descriptions double as the agent-facing guidance for
+#: category H (SPEC.md §9 H): they name the deterministic scopes the dataset
+#: uses ("customer-data" for h-01/h-02, "canary" — the deterministic failure
+#: lane — for h-03). Identical text on all three server variants (§23).
 TASK_TOOL_DESCRIPTIONS = {
     GENERATE_REPORT_TOOL: (
         "Start a simulated monthly-report task; returns the task handle and initial status."
     ),
     GET_REPORT_TASK_TOOL: "Poll a report task by handle; returns status and progress.",
     CANCEL_REPORT_TASK_TOOL: "Cancel a running report task by handle.",
+    START_MIGRATION_TOOL: (
+        "Start a long-running customer-data migration for the given scope; "
+        "returns the task handle, initial status, and progress. Poll "
+        "get_migration_status until it completes."
+    ),
+    GET_MIGRATION_STATUS_TOOL: (
+        "Poll a migration task by handle; returns status, progress, the "
+        "current phase, and the result or error once the task is terminal."
+    ),
+    CANCEL_MIGRATION_TOOL: "Cancel a running migration task by handle.",
 }
 
 
@@ -265,6 +297,18 @@ class ReportTaskHandleInput(BaseModel):
 
 class ReportTaskOutput(BaseModel):
     task: ReportTaskView
+
+
+class StartMigrationInput(BaseModel):
+    scope: str = Field(description=MIGRATION_SCOPE_DESCRIPTION)
+
+
+class MigrationTaskHandleInput(BaseModel):
+    handle: str = Field(description="Migration task handle returned by start_migration")
+
+
+class MigrationTaskOutput(BaseModel):
+    task: MigrationTaskView
 
 
 def _wire_task_status(task: ReportTask) -> Literal["working", "completed", "failed", "cancelled"]:
@@ -436,6 +480,19 @@ def create_server() -> Server[Any]:
                         (CANCEL_REPORT_TASK_TOOL, ReportTaskHandleInput),
                     )
                 ),
+                *(
+                    types.Tool(
+                        name=name,
+                        description=TASK_TOOL_DESCRIPTIONS[name],
+                        input_schema=input_model.model_json_schema(),
+                        output_schema=MigrationTaskOutput.model_json_schema(),
+                    )
+                    for name, input_model in (
+                        (START_MIGRATION_TOOL, StartMigrationInput),
+                        (GET_MIGRATION_STATUS_TOOL, MigrationTaskHandleInput),
+                        (CANCEL_MIGRATION_TOOL, MigrationTaskHandleInput),
+                    )
+                ),
             ]
         )
 
@@ -552,12 +609,12 @@ def create_server() -> Server[Any]:
     async def _on_task_tool(
         ctx: ServerRequestContext[Any], params: types.CallToolRequestParams
     ) -> types.CallToolResult:
-        """M3.2 app-level task tools (SPEC.md §17). Bypasses
-        run_tool_with_faults by design — the task fault story is the world's
-        asynchronous mid-task failure, not a synchronous call failure (see
-        module docstring). The official ADAPTER drives the protocol tasks/*
-        methods; these mirrors keep the tool surface identical across all
-        three variants (SPEC.md §23)."""
+        """M3.2/M3.3 app-level task tools (SPEC.md §17 report kind, §9 H
+        migration kind). Bypasses run_tool_with_faults by design — the task
+        fault story is the world's asynchronous mid-task failure, not a
+        synchronous call failure (see module docstring). The official
+        ADAPTER drives the protocol tasks/* methods; these mirrors keep the
+        tool surface identical across all three variants (SPEC.md §23)."""
         try:
             if params.name == GENERATE_REPORT_TOOL:
                 GenerateMonthlyReportInput.model_validate(params.arguments or {})
@@ -566,15 +623,27 @@ def create_server() -> Server[Any]:
             elif params.name == GET_REPORT_TASK_TOOL:
                 args = ReportTaskHandleInput.model_validate(params.arguments or {})
                 task = world.get_report_task(args.handle)
-            else:
+            elif params.name == CANCEL_REPORT_TASK_TOOL:
                 args = ReportTaskHandleInput.model_validate(params.arguments or {})
                 task = await world.cancel_report_task(args.handle)
+            elif params.name == START_MIGRATION_TOOL:
+                args = StartMigrationInput.model_validate(params.arguments or {})
+                session = ctx.session if _notification_opted_in(ctx) else None
+                task = await world.start_migration(args.scope, fault_engine, session=session)
+            elif params.name == GET_MIGRATION_STATUS_TOOL:
+                args = MigrationTaskHandleInput.model_validate(params.arguments or {})
+                task = world.get_migration_task(args.handle)
+            else:  # CANCEL_MIGRATION_TOOL
+                args = MigrationTaskHandleInput.model_validate(params.arguments or {})
+                task = await world.cancel_migration_task(args.handle)
         except ValidationError as err:
             raise MCPError(
                 INVALID_PARAMS, f"invalid arguments for {params.name}: {err}"
             ) from err
         except WorldError as err:
             return _world_error(err)
+        if isinstance(task, MigrationTask):
+            return _ok(MigrationTaskOutput(task=migration_task_view(task)))
         return _ok(ReportTaskOutput(task=report_task_view(task)))
 
     async def on_call_tool(
@@ -692,17 +761,22 @@ def create_server() -> Server[Any]:
             ],
         )
 
-    # ---- M3.2 protocol Tasks handlers (SPEC.md §17) ----
+    # ---- M3.2/M3.3 protocol Tasks handlers (SPEC.md §17 report kind, §9 H migration kind) ----
     # tasks/* are absent from the per-version SPEC_CLIENT_METHODS tables in
     # mcp 2.1.1, so the runner routes them to these registered handlers with
     # no spec-version pre-validation or result sieve (verified against the
     # installed ServerRunner._on_request / _serialize).
+    # M3.3: the handlers resolve BOTH task kinds through the world registry
+    # (world.find_task / cancel_task / list_tasks — kind-agnostic), so a
+    # migration handle flows through real tasks/get | tasks/cancel |
+    # tasks/list | tasks/result exactly like a report handle (regression:
+    # tests/tasks/test_migration_lifecycle.py).
 
     async def on_tasks_get(
         ctx: ServerRequestContext[Any], params: types.GetTaskRequestParams
     ) -> types.GetTaskResult:
         try:
-            task = world.get_report_task(params.task_id)
+            task = world.find_task(params.task_id)
         except WorldError as err:
             raise MCPError(INVALID_PARAMS, str(err)) from err
         if _notification_opted_in(ctx):
@@ -714,7 +788,7 @@ def create_server() -> Server[Any]:
         _ctx: ServerRequestContext[Any], params: types.CancelTaskRequestParams
     ) -> types.CancelTaskResult:
         try:
-            task = await world.cancel_report_task(params.task_id)
+            task = await world.cancel_task(params.task_id)
         except WorldError as err:
             raise MCPError(INVALID_PARAMS, str(err)) from err
         return types.CancelTaskResult(**_task_result_kwargs(task))
@@ -723,7 +797,7 @@ def create_server() -> Server[Any]:
         _ctx: ServerRequestContext[Any], _params: types.PaginatedRequestParams
     ) -> types.ListTasksResult:
         return types.ListTasksResult(
-            tasks=[_wire_task(task) for task in world.list_report_tasks()]
+            tasks=[_wire_task(task) for task in world.list_tasks()]
         )
 
     async def on_tasks_result(
@@ -733,10 +807,14 @@ def create_server() -> Server[Any]:
         # carries no payload field, so the payload returns as a plain JSON
         # object — the low-level _serialize path passes dicts through.
         try:
-            task = world.get_report_task(params.task_id)
+            task = world.find_task(params.task_id)
         except WorldError as err:
             raise MCPError(INVALID_PARAMS, str(err)) from err
-        return {"task": report_task_view(task).model_dump(mode="json")}
+        if isinstance(task, MigrationTask):
+            view = migration_task_view(task)
+        else:
+            view = report_task_view(task)
+        return {"task": view.model_dump(mode="json")}
 
     server = Server(
         SERVER_NAME,

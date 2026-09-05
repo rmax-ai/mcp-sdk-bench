@@ -18,11 +18,14 @@ next call_tool for the same (name, arguments); the extra wire leg is the
 adapter's protocol mechanics, invisible to the agent loop beyond the
 recorded round trip.
 
-M3.2 (SPEC.md §17): this adapter exercises the APP-LEVEL task surface —
-FastMCP 4.0.2 has no protocol Tasks API (verified: no task methods on the
-server, Client, or Context), so start/poll/cancel map to the plain tools
-generate_monthly_report / get_report_task / cancel_report_task. Classified
-as app-level (never protocol tasks) in docs/capability-matrix.md.
+M3.2 (SPEC.md §17) + M3.3 (SPEC.md §9 H): this adapter exercises the
+APP-LEVEL task surface — FastMCP 4.0.2 has no protocol Tasks API (verified:
+no task methods on the server, Client, or Context), so start/poll/cancel map
+to the plain tools: report kind generate_monthly_report / get_report_task /
+cancel_report_task, migration kind start_migration / get_migration_status /
+cancel_migration (the poll/cancel tool is picked from the handle's kind
+prefix — "migrate-…" routes to the migration tools). Classified as app-level
+(never protocol tasks) in docs/capability-matrix.md.
 """
 from __future__ import annotations
 
@@ -40,6 +43,8 @@ from mcp import types
 from mcp.client.stdio import get_default_environment
 
 from mcp_sdk_bench.adapters.base import (
+    MIGRATION_CANCEL_TOOL,
+    MIGRATION_POLL_TOOL,
     Discovery,
     ElicitationBridge,
     MCPAdapter,
@@ -50,6 +55,8 @@ from mcp_sdk_bench.adapters.base import (
     ToolSpec,
     elicitation_wire_content,
     infer_elicitation_kind,
+    is_migration_handle,
+    resolve_start_tool,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -217,7 +224,7 @@ class FastMCPAdapter(MCPAdapter):
             if isinstance(message.content, types.TextContent)
         )
 
-    # ---- M3.2 app-level task tools (SPEC.md §17) — NOT protocol tasks ----
+    # ---- app-level task tools (SPEC.md §17 M3.2 report / §9 H M3.3 migration) — NOT protocol tasks ----
 
     async def _task_call(self, name: str, arguments: dict) -> TaskView:
         result = await self.call_tool(name, arguments)
@@ -225,17 +232,23 @@ class FastMCPAdapter(MCPAdapter):
             raise RuntimeError(result.text or f"{name} failed")
         return TaskView(**result.structured_content["task"])
 
-    async def start_task(self, name: str) -> TaskView:
-        """Plain tools/call on generate_monthly_report (app-level layer)."""
-        return await self._task_call(name, {})
+    async def start_task(self, name: str, arguments: dict | None = None) -> TaskView:
+        """Plain tools/call on the app-level start tool for the requested
+        kind: generate_monthly_report (report) or start_migration (migration,
+        with ``arguments={"scope": ...}``)."""
+        return await self._task_call(resolve_start_tool(name), dict(arguments or {}))
 
     async def poll_task(self, handle: str) -> TaskView:
-        """Plain tools/call on get_report_task (app-level layer)."""
-        return await self._task_call("get_report_task", {"handle": handle})
+        """Plain tools/call on get_migration_status for a migration handle,
+        else get_report_task (app-level layer)."""
+        poll_tool = MIGRATION_POLL_TOOL if is_migration_handle(handle) else "get_report_task"
+        return await self._task_call(poll_tool, {"handle": handle})
 
     async def cancel_task(self, handle: str) -> TaskView:
-        """Plain tools/call on cancel_report_task (app-level layer)."""
-        return await self._task_call("cancel_report_task", {"handle": handle})
+        """Plain tools/call on cancel_migration for a migration handle, else
+        cancel_report_task (app-level layer)."""
+        cancel_tool = MIGRATION_CANCEL_TOOL if is_migration_handle(handle) else "cancel_report_task"
+        return await self._task_call(cancel_tool, {"handle": handle})
 
     async def close(self) -> None:
         await self._client.__aexit__(None, None, None)

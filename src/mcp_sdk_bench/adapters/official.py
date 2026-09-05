@@ -14,8 +14,16 @@ until respond_to_elicitation delivers the user's payload, then the callback
 returns the ElicitResult and the paused wire call completes. The resume
 surfaces on the next call_tool for the same (name, arguments).
 
-M3.2 (SPEC.md §17): this adapter exercises the REAL MCP Tasks protocol
-surface — the PROTOCOL layer, unlike fastmcp/adk (app-level plain tools).
+M3.2 (SPEC.md §17) + M3.3 (SPEC.md §9 H): this adapter exercises the REAL
+MCP Tasks protocol surface — the PROTOCOL layer, unlike fastmcp/adk
+(app-level plain tools) — for BOTH task kinds. Report tasks start through
+tools/call on generate_monthly_report; migration tasks through tools/call on
+start_migration ({"scope": ...}); in both cases the returned handle is then
+polled/cancelled through the wire methods tasks/get | tasks/cancel |
+tasks/list | tasks/result, and server-pushed notifications (progress + task
+status) are merged into poll results. The migration handles are ordinary
+registry records server-side, so the protocol methods resolve them without
+any adapter-side special-casing.
 ClientSession 2.1.1 ships no task methods (verified: no get_task /
 cancel_task / list_tasks on mcp.client.session.ClientSession), so the task
 requests go through send_request with the mcp.types Tasks vocabulary
@@ -58,6 +66,7 @@ from mcp_sdk_bench.adapters.base import (
     ToolSpec,
     elicitation_wire_content,
     infer_elicitation_kind,
+    resolve_start_tool,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -335,16 +344,22 @@ class OfficialAdapter(MCPAdapter):
         self._task_token_seq += 1
         return f"mcp-sdk-bench-task-{kind}-{self._task_token_seq}"
 
-    async def start_task(self, name: str) -> TaskView:
+    async def start_task(self, name: str, arguments: dict | None = None) -> TaskView:
         """tools/call on the task-starting tool with CreateTaskResult
         semantics (handle + initial status in structuredContent). The _meta
         progressToken opts this client into the task's server-pushed
         notifications (the SDK cannot advertise ClientTasksCapability — see
-        module docstring)."""
+        module docstring).
+
+        ``name`` may be a kind token ("report" | "migration") or the server's
+        app-level start-tool name (generate_monthly_report | start_migration)
+        — both resolve to the same wire tools/call. Migration starts carry
+        ``arguments={"scope": ...}``."""
         assert self._session is not None
+        tool_name = resolve_start_tool(name)
         result = await self._session.call_tool(
-            name,
-            {},
+            tool_name,
+            dict(arguments or {}),
             meta=types.RequestParamsMeta(progress_token=self._next_task_token("start")),
         )
         if not isinstance(result, types.CallToolResult):
