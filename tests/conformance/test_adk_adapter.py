@@ -28,10 +28,13 @@ EXPECTED_TOOLS = {
     "reserve_inventory",
     "deploy_service",
     "probe_schema",
+    "generate_monthly_report",
+    "get_report_task",
+    "cancel_report_task",
 }
 
 
-async def test_adk_adapter_discovers_the_seven_m23a_tools() -> None:
+async def test_adk_adapter_discovers_the_ten_m32_tools() -> None:
     adapter = AdkAdapter()
     try:
         discovery = await adapter.connect()

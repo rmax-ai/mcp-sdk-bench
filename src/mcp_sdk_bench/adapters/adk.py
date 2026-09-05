@@ -16,6 +16,14 @@ Probed against the installed ADK 2.8.0: McpToolset.get_tools() returns McpTool
 objects whose .raw_mcp_tool is an mcp 1.x Tool (camelCase .inputSchema);
 McpTool.run_async(args=..., tool_context=...) returns the CallToolResult as a
 dict with camelCase keys (isError, structuredContent, content).
+
+M3.2 (SPEC.md §17): this adapter exercises the APP-LEVEL task surface —
+mcp 1.x has no Tasks wire surface on the serving path and McpToolset has
+no task client API — so start/poll/cancel map to the plain tools
+generate_monthly_report / get_report_task / cancel_report_task, classified
+as app-level in docs/capability-matrix.md. The framework-native equivalent
+(ADK 2.8.0 ``LongRunningFunctionTool``, verified in envs/adk) lives outside
+MCP and is deliberately not wired in (SPEC.md §23).
 """
 from __future__ import annotations
 
@@ -27,6 +35,7 @@ from typing import Any
 from mcp_sdk_bench.adapters.base import (
     Discovery,
     MCPAdapter,
+    TaskView,
     ToolResult,
     ToolSpec,
 )
@@ -171,6 +180,26 @@ class AdkAdapter(MCPAdapter):
             structured_content=structured,
             text=text or None,
         )
+
+    # ---- M3.2 app-level task tools (SPEC.md §17) — NOT protocol tasks ----
+
+    async def _task_call(self, name: str, arguments: dict) -> TaskView:
+        result = await self.call_tool(name, arguments)
+        if result.is_error or not result.structured_content:
+            raise RuntimeError(result.text or f"{name} failed")
+        return TaskView(**result.structured_content["task"])
+
+    async def start_task(self, name: str) -> TaskView:
+        """Plain tool call on generate_monthly_report (app-level layer)."""
+        return await self._task_call(name, {})
+
+    async def poll_task(self, handle: str) -> TaskView:
+        """Plain tool call on get_report_task (app-level layer)."""
+        return await self._task_call("get_report_task", {"handle": handle})
+
+    async def cancel_task(self, handle: str) -> TaskView:
+        """Plain tool call on cancel_report_task (app-level layer)."""
+        return await self._task_call("cancel_report_task", {"handle": handle})
 
     async def read_resource(self, uri: str) -> str:
         raise RuntimeError(RESOURCE_GAP)

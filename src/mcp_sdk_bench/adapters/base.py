@@ -49,6 +49,22 @@ class Discovery(BaseModel):
     prompts: list[PromptSpec]
 
 
+class TaskView(BaseModel):
+    """SDK-agnostic view of one report task (SPEC.md §17, M3.2).
+
+    `status` uses the WORLD vocabulary (queued/running/completed/failed/
+    cancelled); the official adapter maps the wire Task.status ("working")
+    back to it. `progress` is 0.0..1.0. `result` carries the completed
+    task's payload ({"report_id", "rows", "generated_at"}); `error` the
+    failure message."""
+
+    handle: str
+    status: str
+    progress: float = 0.0
+    result: dict | None = None
+    error: str | None = None
+
+
 class MCPAdapter(ABC):
     """Async-only adapter boundary. One instance == one server session."""
 
@@ -93,6 +109,39 @@ class MCPAdapter(ABC):
         """
         raise NotImplementedError(
             f"{type(self).__name__} has no protocol elicitation surface"
+        )
+
+    async def start_task(self, name: str) -> TaskView:
+        """Start the named long-running task and return its initial view
+        (SPEC.md §17, M3.2).
+
+        Layering contract (the honesty that feeds the capability matrix):
+        the OFFICIAL adapter exercises the real MCP Tasks protocol surface
+        (tools/call returning CreateTaskResult semantics, protocol
+        tasks/get | tasks/cancel | tasks/list, server-pushed
+        notifications/progress + notifications/tasks/status); the FASTMCP
+        and ADK adapters exercise APP-LEVEL plain tools
+        (generate_monthly_report / get_report_task / cancel_report_task)
+        because neither SDK ships a Tasks surface. Each adapter's docstring
+        states which layer it drives. Raises RuntimeError when the server
+        rejects the start (e.g. the 2-concurrent-task limit)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no task surface (protocol or app-level)"
+        )
+
+    async def poll_task(self, handle: str) -> TaskView:
+        """Poll one task. Official: a real tasks/get request, with
+        server-pushed progress merged in; fastmcp/adk: the get_report_task
+        plain tool."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no task surface (protocol or app-level)"
+        )
+
+    async def cancel_task(self, handle: str) -> TaskView:
+        """Cancel one task. Official: a real tasks/cancel request;
+        fastmcp/adk: the cancel_report_task plain tool."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no task surface (protocol or app-level)"
         )
 
     @abstractmethod

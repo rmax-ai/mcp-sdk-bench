@@ -2,7 +2,7 @@
 import anyio
 from mcp.server.stdio import stdio_server
 
-from mcp_sdk_bench.servers.official.server import create_server
+from mcp_sdk_bench.servers.official.server import create_server, initialization_options
 
 
 async def _main() -> None:
@@ -11,7 +11,9 @@ async def _main() -> None:
         await server.run(
             read_stream,
             write_stream,
-            server.create_initialization_options(),
+            # M3.2: includes the declared ServerTasksCapability (the SDK's
+            # get_capabilities never populates `tasks`; see server.py).
+            initialization_options(server),
         )
 
 

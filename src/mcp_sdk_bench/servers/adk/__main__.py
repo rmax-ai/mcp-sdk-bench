@@ -6,8 +6,8 @@ Runs only in the ADK env (envs/adk pins mcp 1.x for google-adk[mcp]):
     PYTHONPATH=src uv run --project envs/adk python -m mcp_sdk_bench.servers.adk --smoke
 
 ``--smoke`` spawns this same module as a stdio MCP server subprocess, lists
-its tools, verifies the seven tool names (M2.1 six + M2.3a create_ticket),
-prints them, and exits 0.
+its tools, verifies the ten tool names (M2.1 six + M2.3a create_ticket +
+M3.2 three app-level task tools), prints them, and exits 0.
 """
 from __future__ import annotations
 
@@ -21,9 +21,12 @@ from mcp.client.stdio import stdio_client
 from mcp_sdk_bench.servers.adk.server import create_server
 
 EXPECTED_TOOLS = (
+    "cancel_report_task",
     "create_ticket",
     "deploy_service",
+    "generate_monthly_report",
     "get_inventory",
+    "get_report_task",
     "get_ticket",
     "probe_schema",
     "reserve_inventory",

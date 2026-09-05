@@ -23,6 +23,46 @@ advertises it by registering an elicitation callback (see
 adapters/official.py). reserve_inventory's employee_id becomes optional in
 the input schema so the clarification flow is reachable from the wire
 (identical schema change in all three variants — SPEC.md §23).
+
+M3.2 (SPEC.md §17) adds REAL protocol Tasks on top of the low-level API.
+mcp 2.1.1's high-level framework (mcp.server.mcpserver) and ServerSession
+have zero task support, but the low-level Server dispatches any registered
+method (tasks/* are not in the per-version SPEC_CLIENT_METHODS tables, so
+they route straight to registered handlers with no version sieve), and
+mcp.types carries the full Tasks vocabulary (Task, GetTaskRequest,
+CancelTaskRequest, ListTasksRequest, GetTaskPayloadRequest,
+TaskStatusNotification, ServerTasksCapability). This variant therefore:
+
+(a) exposes generate_monthly_report as a plain tools/call that starts the
+    world task and returns the task view as structuredContent (CreateTaskResult
+    semantics — the handle + initial status), plus get_report_task /
+    cancel_report_task app-level mirrors (present on ALL three variants for
+    the SPEC.md §23 identical-tool-surface contract; the official ADAPTER
+    drives the protocol tasks/* methods below, not these mirrors);
+(b) registers low-level handlers for tasks/get, tasks/cancel, tasks/list and
+    tasks/result (Server.add_request_handler) mapping to the world registry.
+    tasks/result returns the task payload as a plain JSON object — the SDK's
+    GetTaskPayloadResult type carries no payload field (SDK gap, recorded in
+    docs/capability-matrix.md), so the handler returns a dict, which the
+    low-level _serialize path passes through un-sieved for non-spec methods;
+(c) emits notifications/progress (progressToken = task handle) and
+    notifications/tasks/status on every tick/transition via
+    ServerSession.send_progress_notification / send_notification. Gating:
+    ClientSession 2.1.1 cannot advertise ClientTasksCapability (its
+    _build_capabilities hardcodes sampling/elicitation/roots), so the opt-in
+    is the request _meta progressToken on the start call (or on a tasks/get
+    re-bind) — the only client→server per-request channel the SDK exposes.
+    This is the documented _meta gate the M3.2 dispatch prompt allowed for;
+(d) declares ServerTasksCapability(list/cancel/requests.tools.call) in the
+    capabilities block (see initialization_options(); ServerCapabilities has
+    a `tasks` field but Server.get_capabilities never populates it — set
+    explicitly).
+
+Fault-layer note: the three task tools BYPASS run_tool_with_faults. M3.2
+failure injection is the world's ASYNCHRONOUS mid-task failure (one
+FaultEngine.task_failure() draw at task start, applied at the first
+progress tick); the synchronous per-call fault layer would instead fail the
+start/poll calls themselves, which is not the SPEC.md §17 experiment.
 """
 from __future__ import annotations
 
@@ -46,18 +86,25 @@ from mcp_sdk_bench.faults import (
 )
 from mcp_sdk_bench.world import (
     PROBE_SCHEMA_ENUM_VALUES,
+    REPORT_TASK_TTL_MS,
     Deployment,
     ElicitationUnavailable,
     ElicitFn,
     InventoryItem,
     ProbeNestedItem,
     ProbeNestedObject,
+    ReportTask,
+    ReportTaskStatus,
+    ReportTaskView,
     Ticket,
     TicketStatus,
     World,
     WorldError,
     elicitation_response,
+    load_task_tick_s,
+    report_task_view,
     reset_world,
+    task_timestamp,
 )
 
 SERVER_NAME = "mcp-sdk-bench-official"
@@ -193,6 +240,68 @@ class ProbeSchemaInput(BaseModel):
     nested_list_field: list[ProbeNestedItem]
 
 
+# ---- M3.2 task tools (SPEC.md §17) ----
+
+GENERATE_REPORT_TOOL = "generate_monthly_report"
+GET_REPORT_TASK_TOOL = "get_report_task"
+CANCEL_REPORT_TASK_TOOL = "cancel_report_task"
+
+TASK_TOOL_DESCRIPTIONS = {
+    GENERATE_REPORT_TOOL: (
+        "Start a simulated monthly-report task; returns the task handle and initial status."
+    ),
+    GET_REPORT_TASK_TOOL: "Poll a report task by handle; returns status and progress.",
+    CANCEL_REPORT_TASK_TOOL: "Cancel a running report task by handle.",
+}
+
+
+class GenerateMonthlyReportInput(BaseModel):
+    """No parameters — starts the simulated monthly-report task."""
+
+
+class ReportTaskHandleInput(BaseModel):
+    handle: str = Field(description="Task handle returned by generate_monthly_report")
+
+
+class ReportTaskOutput(BaseModel):
+    task: ReportTaskView
+
+
+def _wire_task_status(task: ReportTask) -> Literal["working", "completed", "failed", "cancelled"]:
+    """World -> wire Task.status. The wire vocabulary has no queued/running
+    split; both map to "working" and the world status rides statusMessage."""
+    if task.status in (ReportTaskStatus.QUEUED, ReportTaskStatus.RUNNING):
+        return "working"
+    return task.status.value
+
+
+def _task_result_kwargs(task: ReportTask) -> dict[str, Any]:
+    return {
+        "task_id": task.handle,
+        "status": _wire_task_status(task),
+        # statusMessage carries the world status (queued/running) or the
+        # failure message — the only per-task text channel the wire Task has.
+        "status_message": task.error if task.status == ReportTaskStatus.FAILED else task.status.value,
+        "created_at": task_timestamp(task.created_seq),
+        "last_updated_at": task_timestamp(task.updated_seq),
+        # The wire Task types REQUIRE ttl and the session dump strips None
+        # (exclude_none=True), so a fixed deterministic value is sent.
+        "ttl": REPORT_TASK_TTL_MS,
+    }
+
+
+def _wire_task(task: ReportTask) -> types.Task:
+    return types.Task(**_task_result_kwargs(task))
+
+
+def _notification_opted_in(ctx: ServerRequestContext[Any]) -> bool:
+    """Client opt-in for task notifications. SDK gap (documented, M3.2):
+    ClientSession 2.1.1 cannot advertise ClientTasksCapability, so the gate
+    is the request _meta progressToken — the base protocol's progress
+    opt-in — instead of the declared capability."""
+    return ctx.meta is not None and ctx.meta.get("progress_token") is not None
+
+
 # ---- tool output models (drive both structuredContent and outputSchema) ----
 
 
@@ -235,6 +344,35 @@ def create_server() -> Server[Any]:
     config is read from the environment once, here, at startup (SPEC.md §21)."""
     world: World = reset_world()
     fault_engine = FaultEngine(load_fault_config())
+
+    async def task_update_hook(task: ReportTask) -> None:
+        """Protocol mechanics for the world notification seam (M3.2, SPEC.md
+        §17): push notifications/progress (progressToken = task handle, so
+        the client correlates notifications to tasks directly) and
+        notifications/tasks/status on every tick/transition to the session
+        bound to this task. The world invokes this only for opted-in tasks
+        (see _notification_opted_in for the capability gate)."""
+        session = world.task_session(task.handle)
+        if session is None:
+            # Rebound clients re-register on their first opt-in tasks/get; a
+            # restarted process has no session until then.
+            return
+        await session.send_progress_notification(
+            task.handle, task.progress, 1.0, task.status.value
+        )
+        # ServerSession.send_notification's type union predates the Tasks
+        # vocabulary; runtime delivery is model_dump + channel write and
+        # accepts TaskStatusNotification fine (verified against 2.1.1).
+        await session.send_notification(
+            cast(
+                "Any",
+                types.TaskStatusNotification(
+                    params=types.TaskStatusNotificationParams(**_task_result_kwargs(task))
+                ),
+            )
+        )
+
+    world.set_task_runtime(tick_s=load_task_tick_s(), update_hook=task_update_hook)
 
     tool_specs: dict[str, tuple[str, type[BaseModel], type[BaseModel]]] = {
         "get_ticket": ("Fetch a single ticket by id.", GetTicketInput, TicketOutput),
@@ -284,6 +422,19 @@ def create_server() -> Server[Any]:
                     description=PROBE_SCHEMA_DESCRIPTION,
                     input_schema=PROBE_SCHEMA_INPUT_SCHEMA,
                     output_schema=ProbeSchemaOutput.model_json_schema(),
+                ),
+                *(
+                    types.Tool(
+                        name=name,
+                        description=TASK_TOOL_DESCRIPTIONS[name],
+                        input_schema=input_model.model_json_schema(),
+                        output_schema=ReportTaskOutput.model_json_schema(),
+                    )
+                    for name, input_model in (
+                        (GENERATE_REPORT_TOOL, GenerateMonthlyReportInput),
+                        (GET_REPORT_TASK_TOOL, ReportTaskHandleInput),
+                        (CANCEL_REPORT_TASK_TOOL, ReportTaskHandleInput),
+                    )
                 ),
             ]
         )
@@ -398,9 +549,39 @@ def create_server() -> Server[Any]:
             is_error=True,
         )
 
+    async def _on_task_tool(
+        ctx: ServerRequestContext[Any], params: types.CallToolRequestParams
+    ) -> types.CallToolResult:
+        """M3.2 app-level task tools (SPEC.md §17). Bypasses
+        run_tool_with_faults by design — the task fault story is the world's
+        asynchronous mid-task failure, not a synchronous call failure (see
+        module docstring). The official ADAPTER drives the protocol tasks/*
+        methods; these mirrors keep the tool surface identical across all
+        three variants (SPEC.md §23)."""
+        try:
+            if params.name == GENERATE_REPORT_TOOL:
+                GenerateMonthlyReportInput.model_validate(params.arguments or {})
+                session = ctx.session if _notification_opted_in(ctx) else None
+                task = await world.start_report_task(fault_engine, session=session)
+            elif params.name == GET_REPORT_TASK_TOOL:
+                args = ReportTaskHandleInput.model_validate(params.arguments or {})
+                task = world.get_report_task(args.handle)
+            else:
+                args = ReportTaskHandleInput.model_validate(params.arguments or {})
+                task = await world.cancel_report_task(args.handle)
+        except ValidationError as err:
+            raise MCPError(
+                INVALID_PARAMS, f"invalid arguments for {params.name}: {err}"
+            ) from err
+        except WorldError as err:
+            return _world_error(err)
+        return _ok(ReportTaskOutput(task=report_task_view(task)))
+
     async def on_call_tool(
         _ctx: ServerRequestContext[Any], params: types.CallToolRequestParams
     ) -> types.CallToolResult:
+        if params.name in TASK_TOOL_DESCRIPTIONS:
+            return await _on_task_tool(_ctx, params)
         async def elicit(payload: dict[str, Any]) -> dict[str, Any]:
             """M3.1 protocol mechanics (SPEC.md §18): send the world's
             elicitation request as ``elicitation/create`` (form mode) on this
@@ -511,7 +692,53 @@ def create_server() -> Server[Any]:
             ],
         )
 
-    return Server(
+    # ---- M3.2 protocol Tasks handlers (SPEC.md §17) ----
+    # tasks/* are absent from the per-version SPEC_CLIENT_METHODS tables in
+    # mcp 2.1.1, so the runner routes them to these registered handlers with
+    # no spec-version pre-validation or result sieve (verified against the
+    # installed ServerRunner._on_request / _serialize).
+
+    async def on_tasks_get(
+        ctx: ServerRequestContext[Any], params: types.GetTaskRequestParams
+    ) -> types.GetTaskResult:
+        try:
+            task = world.get_report_task(params.task_id)
+        except WorldError as err:
+            raise MCPError(INVALID_PARAMS, str(err)) from err
+        if _notification_opted_in(ctx):
+            # Re-bind the notification target (e.g. a reconnected client).
+            world.register_task_session(task.handle, ctx.session)
+        return types.GetTaskResult(**_task_result_kwargs(task))
+
+    async def on_tasks_cancel(
+        _ctx: ServerRequestContext[Any], params: types.CancelTaskRequestParams
+    ) -> types.CancelTaskResult:
+        try:
+            task = await world.cancel_report_task(params.task_id)
+        except WorldError as err:
+            raise MCPError(INVALID_PARAMS, str(err)) from err
+        return types.CancelTaskResult(**_task_result_kwargs(task))
+
+    async def on_tasks_list(
+        _ctx: ServerRequestContext[Any], _params: types.PaginatedRequestParams
+    ) -> types.ListTasksResult:
+        return types.ListTasksResult(
+            tasks=[_wire_task(task) for task in world.list_report_tasks()]
+        )
+
+    async def on_tasks_result(
+        _ctx: ServerRequestContext[Any], params: types.GetTaskPayloadRequestParams
+    ) -> dict[str, Any]:
+        # SDK gap (recorded in docs/capability-matrix.md): GetTaskPayloadResult
+        # carries no payload field, so the payload returns as a plain JSON
+        # object — the low-level _serialize path passes dicts through.
+        try:
+            task = world.get_report_task(params.task_id)
+        except WorldError as err:
+            raise MCPError(INVALID_PARAMS, str(err)) from err
+        return {"task": report_task_view(task).model_dump(mode="json")}
+
+    server = Server(
         SERVER_NAME,
         version=SERVER_VERSION,
         on_list_tools=on_list_tools,
@@ -521,3 +748,34 @@ def create_server() -> Server[Any]:
         on_list_prompts=on_list_prompts,
         on_get_prompt=on_get_prompt,
     )
+    server.add_request_handler("tasks/get", types.GetTaskRequestParams, on_tasks_get)
+    server.add_request_handler("tasks/cancel", types.CancelTaskRequestParams, on_tasks_cancel)
+    server.add_request_handler("tasks/list", types.PaginatedRequestParams, on_tasks_list)
+    server.add_request_handler(
+        "tasks/result", types.GetTaskPayloadRequestParams, on_tasks_result
+    )
+    return server
+
+
+def server_tasks_capability() -> types.ServerTasksCapability:
+    """The Tasks capability this server serves (M3.2)."""
+    return types.ServerTasksCapability(
+        list=types.TasksListCapability(),
+        cancel=types.TasksCancelCapability(),
+        requests=types.ServerTasksRequestsCapability(
+            tools=types.TasksToolsCapability(call=types.TasksCallCapability())
+        ),
+    )
+
+
+def initialization_options(server: Server[Any]) -> Any:
+    """server.create_initialization_options() PLUS the Tasks capability.
+
+    SDK gap (documented, M3.2): ServerCapabilities HAS a `tasks` field, but
+    Server.get_capabilities derives only prompts/resources/tools/logging/
+    completions from the registered handlers and never populates `tasks`
+    even when tasks/* handlers are registered — declared explicitly here.
+    """
+    options = server.create_initialization_options()
+    options.capabilities.tasks = server_tasks_capability()
+    return options

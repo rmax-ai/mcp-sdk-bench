@@ -3,17 +3,43 @@
 Single source of truth for all server variants and all graders.
 Rules:
 - No wall-clock anywhere in state; mutation ordering is a monotonic counter.
+  (M3.2 tasks: asyncio sleeps pace the ticker — runtime pacing, not state
+  ordering; wire timestamps are synthesized from the op counter, never
+  wall-clock.)
 - All mutations go through World methods so op_log is complete and
   graders can verify correct_final_state without LLM judging.
 - Fixture data lives in fixtures.py; reset.py rebuilds from seed.
-"""
+
+M3.2 (SPEC.md §17 Tasks): the world owns the report-task registry —
+``generate_monthly_report`` starts a simulated long-running report task with
+deterministic progress ticks (0.0, 0.2, ..., 1.0), a status enum
+(queued/running/completed/failed/cancelled), a 2-concurrent-task limit, and
+fault integration: ``FaultEngine.task_failure()`` is drawn ONCE at task start
+and, when it fires, the task fails at its first progress tick with the
+canonical ``INJECTED_TASK_FAILURE`` message (an ASYNCHRONOUS mid-task failure
+— the synchronous per-call fault layer in the servers deliberately does not
+wrap the task tools; see the server module docstrings). Registry records are
+ordinary World fields, so they persist with the world store
+(MCP_BENCH_WORLD_STATE_FILE, see reset.py) and survive a server-process
+restart; the asyncio runners are process-local and are re-spawned lazily by
+whichever task method runs first on the new process (``_ensure_task_runners``).
+
+Notification seam (mirrors the elicitation seam): the WORLD owns the policy
+(a task notifies the session that started it — or re-bound it via an opt-in
+poll — and only when that client opted in); the SERVER VARIANT owns the
+protocol mechanics behind ``set_task_update_hook`` (official: wire
+``notifications/progress`` + ``notifications/tasks/status``; fastmcp/adk: no
+hook, app-level polling only)."""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class TicketStatus(str, Enum):
@@ -118,6 +144,115 @@ ELICIT_APPROVAL = "approval"
 DEPLOYMENT_DECLINED = "deployment declined by user"
 
 
+# ---- report task registry (SPEC.md §17, M3.2) ----
+
+#: Canonical world statuses for a report task. The MCP wire Task.status
+#: vocabulary (working/input_required/completed/failed/cancelled) has no
+#: queued/running split; server variants map queued+running to "working" and
+#: carry the world status in statusMessage (see servers/official/server.py).
+class ReportTaskStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+#: Terminal states: a task in one of these never ticks again and cannot be
+#: cancelled.
+REPORT_TASK_TERMINAL: frozenset[ReportTaskStatus] = frozenset(
+    {ReportTaskStatus.COMPLETED, ReportTaskStatus.FAILED, ReportTaskStatus.CANCELLED}
+)
+
+#: Progress steps of the simulated monthly-report task (SPEC.md §17): ticks
+#: advance 0.2 at a time until 1.0 == completed.
+REPORT_TASK_PROGRESS_STEPS: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0)
+
+#: Default seconds between progress ticks. Tests and the CLI override via
+#: MCP_BENCH_TASK_TICK_S to keep the hermetic suite fast; the nominal
+#: 15-second report of SPEC.md §17 maps to the default pacing.
+DEFAULT_TASK_TICK_S = 2.0
+
+#: The registry supports exactly two concurrently active (queued/running)
+#: tasks; a third start is rejected with WorldError.
+MAX_ACTIVE_REPORT_TASKS = 2
+
+#: Deterministic row count of the simulated report.
+REPORT_ROWS = 1200
+
+#: Fixed TTL (ms) stamped on wire Task objects. The mcp 2.1.1 wire types
+#: REQUIRE the ttl key (no default) and the session dump strips None, so a
+#: real value must be sent; deterministic, wall-clock-free.
+REPORT_TASK_TTL_MS = 3_600_000
+
+
+def task_timestamp(seq: int) -> str:
+    """Deterministic synthetic timestamp derived from the op counter — the
+    world has no wall clock, so wire createdAt/lastUpdatedAt values are
+    functions of mutation order, identical across runs and SDKs."""
+    return (datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=seq)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class ReportTask(BaseModel):
+    """One registered report task (persisted with the world store)."""
+
+    handle: str
+    status: ReportTaskStatus
+    progress: float = 0.0
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    #: Number of progress ticks already applied (resume point after a
+    #: server-process restart).
+    tick: int = 0
+    #: Drawn once at start from FaultEngine.task_failure(); when true the task
+    #: fails at its first progress tick.
+    will_fail: bool = False
+    #: Whether the client that started (or re-bound) this task opted into
+    #: server-pushed notifications. Persisted so the policy survives restart;
+    #: the session it refers to is process-local (_task_sessions).
+    notify_opt_in: bool = False
+    created_seq: int
+    updated_seq: int
+
+
+class ReportTaskView(BaseModel):
+    """The SDK-agnostic task view shared by all three server variants'
+    structured output and mapped to adapters.base.TaskView."""
+
+    handle: str
+    status: str
+    progress: float
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+
+def report_task_view(task: ReportTask) -> ReportTaskView:
+    return ReportTaskView(
+        handle=task.handle,
+        status=task.status.value,
+        progress=task.progress,
+        result=task.result,
+        error=task.error,
+    )
+
+
+def load_task_tick_s(env: dict[str, str] | None = None) -> float:
+    """Seconds between progress ticks (default DEFAULT_TASK_TICK_S). Read once
+    at server startup from MCP_BENCH_TASK_TICK_S."""
+    import os
+
+    raw = (os.environ if env is None else env).get("MCP_BENCH_TASK_TICK_S")
+    if raw is None or raw == "":
+        return DEFAULT_TASK_TICK_S
+    try:
+        value = float(raw)
+    except ValueError as err:
+        raise ValueError(f"invalid value for MCP_BENCH_TASK_TICK_S: {raw!r}") from err
+    if value <= 0:
+        raise ValueError(f"MCP_BENCH_TASK_TICK_S must be > 0, got {raw!r}")
+    return value
+
+
 def clarification_payload(field: str, question: str) -> dict[str, Any]:
     """Normalized clarification request: ask the user for one string field."""
     return {
@@ -208,6 +343,20 @@ class World(BaseModel):
     #: (SPEC.md §21). Populated on first execution only; a retry with a known
     #: key is a replay and never creates a second ticket.
     ticket_idempotency_keys: dict[str, str] = Field(default_factory=dict)
+    #: M3.2 report task registry (SPEC.md §17): handle -> task record.
+    #: Ordinary world state, so it persists with the world store
+    #: (MCP_BENCH_WORLD_STATE_FILE) and survives a server-process restart.
+    report_tasks: dict[str, ReportTask] = Field(default_factory=dict)
+    #: Monotonic handle counter (persisted; handles stay unique across
+    #: restarts sharing one world store).
+    report_task_seq: int = 0
+
+    # ---- process-local task runtime (never serialized) ----
+    _task_runners: dict[str, asyncio.Task[None]] = PrivateAttr(default_factory=dict)
+    _task_update_hook: Callable[[ReportTask], Awaitable[None]] | None = PrivateAttr(None)
+    _task_sessions: dict[str, Any] = PrivateAttr(default_factory=dict)
+    _task_tick_s: float = PrivateAttr(DEFAULT_TASK_TICK_S)
+    _state_file: Path | None = PrivateAttr(None)
 
     # ---- mutation surface (single implementation shared by all server variants) ----
 
@@ -419,3 +568,177 @@ class World(BaseModel):
         if employee_id not in self.employees:
             raise WorldError(f"unknown employee {employee_id}")
         return self.employees[employee_id]
+
+    # ---- report task registry (SPEC.md §17, M3.2) ----
+
+    def set_task_runtime(
+        self,
+        *,
+        tick_s: float,
+        update_hook: Callable[[ReportTask], Awaitable[None]] | None = None,
+    ) -> None:
+        """Per-process runtime configuration, called once by the server
+        variant at startup. `update_hook` is the notification seam: invoked
+        (awaited) after every task transition; None for variants without a
+        server-pushed notification surface (fastmcp/adk)."""
+        self._task_tick_s = tick_s
+        self._task_update_hook = update_hook
+
+    def set_state_file(self, path: Path | None) -> None:
+        """Attach the world store file (reset.py; MCP_BENCH_WORLD_STATE_FILE).
+        Task transitions persist the whole world there."""
+        self._state_file = path
+
+    def _persist(self) -> None:
+        if self._state_file is not None:
+            self._state_file.write_text(self.model_dump_json())
+
+    def register_task_session(self, handle: str, session: Any) -> None:
+        """Bind the notification target for `handle` to `session` and mark the
+        task opted in (world policy: the client that started the task — or
+        re-bound it with an opt-in poll — receives its notifications).
+
+        Direct dict lookup, NOT get_report_task: this runs mid-start before
+        the runner is registered, and _ensure_task_runners would spawn a
+        duplicate runner for the not-yet-registered handle."""
+        if handle not in self.report_tasks:
+            raise WorldError(f"report task {handle} not found")
+        self.report_tasks[handle].notify_opt_in = True
+        self._task_sessions[handle] = session
+
+    def task_session(self, handle: str) -> Any | None:
+        return self._task_sessions.get(handle)
+
+    def _ensure_task_runners(self) -> None:
+        """Lazily (re)spawn asyncio runners for persisted queued/running
+        tasks. Called from every task registry method, so a fresh server
+        process sharing the world store resumes its tasks on the first
+        task-related call — create_server() itself may run outside an event
+        loop (fastmcp variant), hence lazy rather than at construction."""
+        for task in self.report_tasks.values():
+            if task.status not in REPORT_TASK_TERMINAL and (
+                task.handle not in self._task_runners or self._task_runners[task.handle].done()
+            ):
+                self._task_runners[task.handle] = asyncio.create_task(
+                    self._run_report_task(task.handle)
+                )
+
+    async def start_report_task(
+        self, fault_engine: Any, *, session: Any | None = None
+    ) -> ReportTask:
+        """Start a simulated monthly-report task (SPEC.md §17).
+
+        Draws ``fault_engine.task_failure()`` ONCE here (deterministic per
+        seed); when it fires the task fails asynchronously at its first
+        progress tick with the canonical injected-task-failure message. At
+        most MAX_ACTIVE_REPORT_TASKS tasks may be active concurrently; a
+        third start raises WorldError.
+        """
+        # Deferred import: faults.py imports this module (no import cycle).
+        from mcp_sdk_bench.faults import INJECTED_TASK_FAILURE
+
+        self._ensure_task_runners()
+        active = [
+            t for t in self.report_tasks.values() if t.status not in REPORT_TASK_TERMINAL
+        ]
+        if len(active) >= MAX_ACTIVE_REPORT_TASKS:
+            raise WorldError(
+                f"report task limit reached ({MAX_ACTIVE_REPORT_TASKS} concurrent tasks)"
+            )
+        will_fail = fault_engine.task_failure()
+        self.report_task_seq += 1
+        handle = f"report-{self.report_task_seq:03d}"
+        task = ReportTask(
+            handle=handle,
+            status=ReportTaskStatus.QUEUED,
+            will_fail=will_fail,
+            created_seq=len(self.op_log),
+            updated_seq=len(self.op_log),
+        )
+        self.report_tasks[handle] = task
+        self._record_task(task, "start", injected_failure_message=INJECTED_TASK_FAILURE)
+        # Spawn the runner BEFORE any other registry call so
+        # _ensure_task_runners never double-spawns this handle.
+        self._task_runners[handle] = asyncio.create_task(self._run_report_task(handle))
+        if session is not None:
+            self.register_task_session(handle, session)
+        return task
+
+    def get_report_task(self, handle: str) -> ReportTask:
+        self._ensure_task_runners()
+        if handle not in self.report_tasks:
+            raise WorldError(f"report task {handle} not found")
+        return self.report_tasks[handle]
+
+    def list_report_tasks(self) -> list[ReportTask]:
+        self._ensure_task_runners()
+        return list(self.report_tasks.values())
+
+    async def cancel_report_task(self, handle: str) -> ReportTask:
+        """Cancel a queued/running task: the ticker stops, no result is ever
+        produced. Cancelling a terminal task raises WorldError."""
+        task = self.get_report_task(handle)
+        if task.status in REPORT_TASK_TERMINAL:
+            raise WorldError(f"report task {handle} is already {task.status.value}")
+        task.status = ReportTaskStatus.CANCELLED
+        runner = self._task_runners.pop(handle, None)
+        if runner is not None:
+            runner.cancel()
+        self._record_task(task, "cancel")
+        return task
+
+    def _record_task(self, task: ReportTask, event: str, **extra: Any) -> None:
+        task.updated_seq = len(self.op_log)
+        self._record(
+            f"report_task_{event}",
+            "report_task",
+            task.handle,
+            status=task.status.value,
+            progress=task.progress,
+            tick=task.tick,
+            **extra,
+        )
+        self._persist()
+
+    async def _notify_task(self, task: ReportTask) -> None:
+        hook = self._task_update_hook
+        if hook is not None and task.notify_opt_in:
+            await hook(task)
+
+    async def _run_report_task(self, handle: str) -> None:
+        """The ticker: QUEUED -> RUNNING, then one progress step per tick;
+        completes at 1.0. A will_fail task fails at its FIRST progress tick
+        (the M3.2 asynchronous injected failure). Cancellation is delivered
+        by cancel_report_task, which sets the status before cancelling."""
+        from mcp_sdk_bench.faults import INJECTED_TASK_FAILURE
+
+        task = self.report_tasks[handle]
+        try:
+            if task.status == ReportTaskStatus.QUEUED:
+                task.status = ReportTaskStatus.RUNNING
+                self._record_task(task, "running")
+                await self._notify_task(task)
+            for step in REPORT_TASK_PROGRESS_STEPS[task.tick :]:
+                await asyncio.sleep(self._task_tick_s)
+                if task.will_fail and task.tick == 0:
+                    task.status = ReportTaskStatus.FAILED
+                    task.error = INJECTED_TASK_FAILURE
+                    self._record_task(task, "fail")
+                    await self._notify_task(task)
+                    return
+                task.tick += 1
+                task.progress = step
+                if step >= 1.0:
+                    task.status = ReportTaskStatus.COMPLETED
+                    task.result = {
+                        "report_id": f"monthly-{handle}",
+                        "rows": REPORT_ROWS,
+                        "generated_at": task_timestamp(task.updated_seq),
+                    }
+                    self._record_task(task, "complete")
+                else:
+                    self._record_task(task, "tick")
+                await self._notify_task(task)
+        except asyncio.CancelledError:
+            # cancel_report_task already set the terminal status.
+            return

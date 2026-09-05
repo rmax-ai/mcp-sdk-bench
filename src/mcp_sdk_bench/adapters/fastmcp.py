@@ -17,6 +17,12 @@ input_responses and the paused call completes. The resume surfaces on the
 next call_tool for the same (name, arguments); the extra wire leg is the
 adapter's protocol mechanics, invisible to the agent loop beyond the
 recorded round trip.
+
+M3.2 (SPEC.md §17): this adapter exercises the APP-LEVEL task surface —
+FastMCP 4.0.2 has no protocol Tasks API (verified: no task methods on the
+server, Client, or Context), so start/poll/cancel map to the plain tools
+generate_monthly_report / get_report_task / cancel_report_task. Classified
+as app-level (never protocol tasks) in docs/capability-matrix.md.
 """
 from __future__ import annotations
 
@@ -39,6 +45,7 @@ from mcp_sdk_bench.adapters.base import (
     MCPAdapter,
     PromptSpec,
     ResourceSpec,
+    TaskView,
     ToolResult,
     ToolSpec,
     elicitation_wire_content,
@@ -209,6 +216,26 @@ class FastMCPAdapter(MCPAdapter):
             for message in result.messages
             if isinstance(message.content, types.TextContent)
         )
+
+    # ---- M3.2 app-level task tools (SPEC.md §17) — NOT protocol tasks ----
+
+    async def _task_call(self, name: str, arguments: dict) -> TaskView:
+        result = await self.call_tool(name, arguments)
+        if result.is_error or not result.structured_content:
+            raise RuntimeError(result.text or f"{name} failed")
+        return TaskView(**result.structured_content["task"])
+
+    async def start_task(self, name: str) -> TaskView:
+        """Plain tools/call on generate_monthly_report (app-level layer)."""
+        return await self._task_call(name, {})
+
+    async def poll_task(self, handle: str) -> TaskView:
+        """Plain tools/call on get_report_task (app-level layer)."""
+        return await self._task_call("get_report_task", {"handle": handle})
+
+    async def cancel_task(self, handle: str) -> TaskView:
+        """Plain tools/call on cancel_report_task (app-level layer)."""
+        return await self._task_call("cancel_report_task", {"handle": handle})
 
     async def close(self) -> None:
         await self._client.__aexit__(None, None, None)

@@ -33,6 +33,17 @@ are pinned explicitly so the guard-leg return type never leaks into the wire
 contract. On handshake-era connections (< 2026-07-28) the guard return is
 rejected with FastMCP's era error (documented limitation; the benchmark's
 FastMCP client is always modern).
+
+M3.2 (SPEC.md §17 Tasks): FastMCP 4.0.2 has NO Tasks surface at all —
+verified against the installed package: no task API on the server, client,
+or Context. The three tools below (generate_monthly_report /
+get_report_task / cancel_report_task) are therefore the APP-LEVEL
+equivalent: the same world task registry driven by plain tool calls,
+classified as such (never as protocol tasks) in docs/capability-matrix.md.
+Like the official variant's task mirrors, they bypass run_tool_with_faults
+by design: the M3.2 fault story is the world's asynchronous mid-task
+failure (one FaultEngine.task_failure() draw at task start, applied at the
+first progress tick), not a synchronous call failure.
 """
 from __future__ import annotations
 
@@ -60,11 +71,14 @@ from mcp_sdk_bench.world import (
     InventoryItem,
     ProbeNestedItem,
     ProbeNestedObject,
+    ReportTaskView,
     Ticket,
     TicketStatus,
     World,
     WorldError,
     elicitation_response,
+    load_task_tick_s,
+    report_task_view,
     reset_world,
 )
 
@@ -156,6 +170,12 @@ class ProbeSchemaOutput(BaseModel):
     count: int
 
 
+class ReportTaskOutput(BaseModel):
+    """M3.2 app-level task view envelope (identical across variants)."""
+
+    task: ReportTaskView
+
+
 class SchemaEnum(str, Enum):
     """Enum for probe_schema.enum_field; FastMCP generates the schema
     constraint from this class (verified against installed FastMCP 4.0.2:
@@ -189,6 +209,9 @@ def create_server() -> FastMCP:
     config is read from the environment once, here, at startup (SPEC.md §21)."""
     world: World = reset_world()
     fault_engine = FaultEngine(load_fault_config())
+    # M3.2: no update_hook — FastMCP 4.0.2 has no server-pushed task
+    # notification surface; clients poll (app-level classification).
+    world.set_task_runtime(tick_s=load_task_tick_s())
     server = FastMCP(SERVER_NAME, version=SERVER_VERSION)
 
     @overload
@@ -360,6 +383,55 @@ def create_server() -> FastMCP:
                 )
             )
         )
+
+    @server.tool(
+        description=(
+            "Start a simulated monthly-report task; returns the task handle and "
+            "initial status. App-level equivalent of MCP Tasks (FastMCP 4.0.2 "
+            "has no protocol Tasks surface) — SPEC.md §17."
+        )
+    )
+    async def generate_monthly_report() -> ReportTaskOutput:
+        # Bypasses the synchronous fault layer by design (module docstring).
+        try:
+            task = await world.start_report_task(fault_engine)
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+        return ReportTaskOutput(task=report_task_view(task))
+
+    @server.tool(
+        description=(
+            "Poll a report task by handle; returns status and progress "
+            "(app-level equivalent of tasks/get — SPEC.md §17)."
+        )
+    )
+    async def get_report_task(
+        handle: Annotated[
+            str, Field(description="Task handle returned by generate_monthly_report")
+        ],
+    ) -> ReportTaskOutput:
+        try:
+            task = world.get_report_task(handle)
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+        return ReportTaskOutput(task=report_task_view(task))
+
+    @server.tool(
+        description=(
+            "Cancel a running report task by handle (app-level equivalent of "
+            "tasks/cancel — SPEC.md §17)."
+        )
+    )
+    async def cancel_report_task(
+        handle: Annotated[
+            str, Field(description="Task handle returned by generate_monthly_report")
+        ],
+    ) -> ReportTaskOutput:
+        try:
+            task = await world.cancel_report_task(handle)
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+        return ReportTaskOutput(task=report_task_view(task))
 
     @server.resource(
         DEPLOYMENT_POLICY_URI,

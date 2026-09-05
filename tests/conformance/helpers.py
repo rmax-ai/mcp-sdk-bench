@@ -74,8 +74,11 @@ INCIDENT_TRIAGE_PROMPT = "incident-triage"
 #: module must not be imported).
 INVALID_PARAMS = -32602
 
-#: The seven-tool contract: the five M1 world tools plus probe_schema (M2.1)
-#: plus create_ticket (M2.3a, SPEC.md §21 idempotent creation).
+#: The ten-tool contract: the five M1 world tools plus probe_schema (M2.1)
+#: plus create_ticket (M2.3a, SPEC.md §21 idempotent creation) plus the three
+#: M3.2 task tools (SPEC.md §17: generate_monthly_report / get_report_task /
+#: cancel_report_task — identical surface on all three variants; the official
+#: variant additionally serves the protocol tasks/* methods).
 EXPECTED_TOOLS = frozenset(
     {
         "get_ticket",
@@ -85,6 +88,9 @@ EXPECTED_TOOLS = frozenset(
         "reserve_inventory",
         "deploy_service",
         "probe_schema",
+        "generate_monthly_report",
+        "get_report_task",
+        "cancel_report_task",
     }
 )
 

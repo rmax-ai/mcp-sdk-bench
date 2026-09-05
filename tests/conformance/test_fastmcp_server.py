@@ -25,6 +25,9 @@ EXPECTED_TOOLS = {
     "reserve_inventory",
     "deploy_service",
     "probe_schema",
+    "generate_monthly_report",
+    "get_report_task",
+    "cancel_report_task",
 }
 
 
@@ -38,7 +41,7 @@ def _text(result: types.CallToolResult) -> str:
     )
 
 
-async def test_tools_list_has_exactly_the_seven_m23a_tools() -> None:
+async def test_tools_list_has_exactly_the_ten_m32_tools() -> None:
     async with _client() as client:
         tools = await client.list_tools()
         assert {tool.name for tool in tools} == EXPECTED_TOOLS

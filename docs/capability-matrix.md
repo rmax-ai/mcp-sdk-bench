@@ -17,11 +17,11 @@ Legend (SPEC.md §7): ✅ supported · ◐ partially · 🔁 via another abstrac
 | 2026-07-28 protocol | TBD | TBD | TBD | TBD | TBD |
 | Legacy protocol negotiation | TBD | TBD | TBD | TBD | TBD |
 | Sampling | TBD | TBD | TBD | TBD | TBD |
-| Elicitation | TBD | TBD | TBD | TBD | TBD |
-| Multi-round-trip | TBD | TBD | TBD | TBD | TBD |
-| Tasks | TBD | TBD | TBD | TBD | TBD |
-| Cancellation | TBD | TBD | TBD | TBD | TBD |
-| Progress | TBD | TBD | TBD | TBD | TBD |
+| Elicitation | ✅ server-side (SEP-2322 guard pattern; `ctx.elicit()` unavailable post-SEP-2577) | ❌ no elicitation over mcp 1.x | ✅ `elicitation/create` in-band (`ServerSession.elicit_form`) | Client-advertised (2026-07-28) | [spec](https://modelcontextprotocol.io/specification/2026-07-28/server/elicitation) + `tests/interactive/` (g-03 9/9) |
+| Multi-round-trip | ✅ | ✅ (tool-only) | ✅ | In-band elicitation round-trips | `tests/interactive/` + results `m31b-r1..3` (f-02/g-01/g-02) |
+| Tasks | 🔁 app-level plain tools — 4.0.2 has no Tasks surface (server/client/Context verified empty) | 🔁 app-level plain tools; `LongRunningFunctionTool` native, documented not wired | ◐ real protocol tasks via low-level handlers (`tasks/get|cancel|list|result`); high-level framework has zero; ClientTasksCapability advert missing in 2.1.1 (`_meta` progressToken gate); `GetTaskPayloadResult` lacks payload field | Tasks ext (2026-07-28) | [spec](https://modelcontextprotocol.io/specification/2026-07-28/server/tasks) + `tests/tasks/` |
+| Cancellation | 🔁 `cancel_report_task` tool | 🔁 `cancel_report_task` tool | ✅ real `tasks/cancel` on the wire | Tasks ext | `tests/tasks/test_task_lifecycle.py` |
+| Progress | 🔁 poll-only (no server-pushed task notification surface) | 🔁 poll-only | ✅ server-pushed `ProgressNotification` + `TaskStatusNotification` per tick (progressToken gate) | Notifications (2026-07-28) | `tests/tasks/test_task_lifecycle.py` |
 | OAuth | TBD | TBD | TBD | TBD | TBD |
 | Client credentials | TBD | TBD | TBD | TBD | TBD |
 | Identity propagation | TBD | TBD | TBD | TBD | TBD |

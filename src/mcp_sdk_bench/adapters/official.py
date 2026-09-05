@@ -13,19 +13,39 @@ ElicitationBridge pauses the adapter call (ToolResult.elicitation_request)
 until respond_to_elicitation delivers the user's payload, then the callback
 returns the ElicitResult and the paused wire call completes. The resume
 surfaces on the next call_tool for the same (name, arguments).
+
+M3.2 (SPEC.md §17): this adapter exercises the REAL MCP Tasks protocol
+surface — the PROTOCOL layer, unlike fastmcp/adk (app-level plain tools).
+ClientSession 2.1.1 ships no task methods (verified: no get_task /
+cancel_task / list_tasks on mcp.client.session.ClientSession), so the task
+requests go through send_request with the mcp.types Tasks vocabulary
+(GetTaskRequest / CancelTaskRequest / ListTasksRequest /
+GetTaskPayloadRequest — real wire methods tasks/get, tasks/cancel,
+tasks/list, tasks/result against the server's registered low-level
+handlers). Server-pushed notifications: notifications/progress parses at
+the negotiated 2025-11-25 version and tees to message_handler;
+notifications/tasks/status is absent from every per-version method table
+(SDK gap), so it arrives through a NotificationBinding. Both feed the poll
+result: poll_task merges server-pushed progress with the tasks/get
+snapshot (and fetches the completed payload via tasks/result). The client
+cannot advertise ClientTasksCapability (_build_capabilities hardcodes
+sampling/elicitation/roots), so it opts into notifications with a request
+_meta progressToken on start/poll — documented in servers/official.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters, types
+from mcp.client.extension import NotificationBinding
 from mcp.client.stdio import get_default_environment, stdio_client
 from mcp.shared.exceptions import MCPError
+from pydantic import BaseModel, ConfigDict
 
 from mcp_sdk_bench.adapters.base import (
     Discovery,
@@ -33,6 +53,7 @@ from mcp_sdk_bench.adapters.base import (
     MCPAdapter,
     PromptSpec,
     ResourceSpec,
+    TaskView,
     ToolResult,
     ToolSpec,
     elicitation_wire_content,
@@ -57,6 +78,40 @@ class _PausedCall:
     arguments: dict[str, Any]
 
 
+@dataclass
+class _TaskPush:
+    """Server-pushed task notification cache (M3.2, SPEC.md §17).
+
+    progress: handle -> max pushed progress (notifications/progress,
+    progressToken = task handle); statuses: handle -> latest pushed wire
+    status (notifications/tasks/status, via NotificationBinding); events:
+    ordered (handle, progress) log for wire-level assertions."""
+
+    progress: dict[str, float] = field(default_factory=dict)
+    statuses: dict[str, str] = field(default_factory=dict)
+    events: list[tuple[str, float]] = field(default_factory=list)
+
+
+class _TaskResultPayload(BaseModel):
+    """tasks/result response envelope: the server returns the task view as a
+    plain JSON object (SDK gap: GetTaskPayloadResult carries no payload
+    field), and send_request's result TypeVar is bound to BaseModel, so a
+    typed envelope is needed here."""
+
+    model_config = ConfigDict(extra="allow")
+
+    task: dict[str, Any] | None = None
+
+
+def _world_status(wire_status: str, status_message: str | None) -> str:
+    """Wire Task.status -> world vocabulary. The wire has no queued/running
+    split ("working" covers both); the server carries the world status in
+    statusMessage."""
+    if wire_status == "working":
+        return status_message if status_message in ("queued", "running") else "running"
+    return wire_status
+
+
 class OfficialAdapter(MCPAdapter):
     def __init__(self, env: dict[str, str] | None = None) -> None:
         #: Extra env vars merged over the SDK default subprocess environment
@@ -69,6 +124,9 @@ class OfficialAdapter(MCPAdapter):
         #: M3.1 elicitation plumbing (SPEC.md §18).
         self._elicit_bridge = ElicitationBridge()
         self._paused: _PausedCall | None = None
+        #: M3.2 task plumbing (SPEC.md §17).
+        self._task_push = _TaskPush()
+        self._task_token_seq = 0
 
     async def connect(self) -> Discovery:
         params = StdioServerParameters(
@@ -83,7 +141,20 @@ class OfficialAdapter(MCPAdapter):
         # ElicitationCapability (form mode) at initialize (mcp 2.1.1:
         # ClientSession advertises it iff a non-default callback is set).
         self._session_cm = ClientSession(
-            read_stream, write_stream, elicitation_callback=self._on_elicitation
+            read_stream,
+            write_stream,
+            elicitation_callback=self._on_elicitation,
+            # M3.2: message_handler receives notifications/progress (core
+            # table parses it at 2025-11-25); the binding receives
+            # notifications/tasks/status (absent from every version table).
+            message_handler=self._on_message,
+            notification_bindings=[
+                NotificationBinding(
+                    method="notifications/tasks/status",
+                    params_type=types.TaskStatusNotificationParams,
+                    handler=self._on_task_status,
+                )
+            ],
         )
         self._session = await self._session_cm.__aenter__()
         await self._session.initialize()
@@ -232,6 +303,122 @@ class OfficialAdapter(MCPAdapter):
             for message in result.messages
             if isinstance(message.content, types.TextContent)
         )
+
+    # ---- M3.2 protocol Tasks (SPEC.md §17) — the PROTOCOL layer ----
+
+    async def _on_message(self, message: Any) -> None:
+        """ClientSession message_handler tee: capture server-pushed
+        notifications/progress (progressToken = task handle)."""
+        if isinstance(message, types.ProgressNotification):
+            handle = str(message.params.progress_token)
+            progress = float(message.params.progress)
+            self._task_push.progress[handle] = max(
+                self._task_push.progress.get(handle, 0.0), progress
+            )
+            self._task_push.events.append((handle, progress))
+
+    async def _on_task_status(self, params: types.TaskStatusNotificationParams) -> None:
+        """NotificationBinding handler for notifications/tasks/status."""
+        self._task_push.statuses[params.task_id] = params.status
+
+    def pushed_progress(self, handle: str) -> list[float]:
+        """Ordered server-pushed progress values for `handle` (wire-level
+        assertion surface for tests/tasks/)."""
+        return [progress for h, progress in self._task_push.events if h == handle]
+
+    def pushed_status(self, handle: str) -> str | None:
+        """Latest server-pushed wire status for `handle`
+        (notifications/tasks/status via the NotificationBinding), or None."""
+        return self._task_push.statuses.get(handle)
+
+    def _next_task_token(self, kind: str) -> str:
+        self._task_token_seq += 1
+        return f"mcp-sdk-bench-task-{kind}-{self._task_token_seq}"
+
+    async def start_task(self, name: str) -> TaskView:
+        """tools/call on the task-starting tool with CreateTaskResult
+        semantics (handle + initial status in structuredContent). The _meta
+        progressToken opts this client into the task's server-pushed
+        notifications (the SDK cannot advertise ClientTasksCapability — see
+        module docstring)."""
+        assert self._session is not None
+        result = await self._session.call_tool(
+            name,
+            {},
+            meta=types.RequestParamsMeta(progress_token=self._next_task_token("start")),
+        )
+        if not isinstance(result, types.CallToolResult):
+            raise TypeError(f"unexpected result type {type(result).__name__}")
+        if result.is_error or not result.structured_content:
+            raise RuntimeError(_text_of(result.content) or "task start failed")
+        return TaskView(**result.structured_content["task"])
+
+    async def poll_task(self, handle: str) -> TaskView:
+        """Real tasks/get request; server-pushed progress merged in. On
+        completion the payload is fetched with a real tasks/result request
+        (the wire Task carries no result payload; the server's tasks/result
+        returns the view as a JSON object — SDK gap documented server-side).
+        The poll carries a progressToken so a RECONNECTED client re-binds
+        the task's notification target to this session."""
+        assert self._session is not None
+        wire = await self._session.send_request(
+            types.GetTaskRequest(
+                params=types.GetTaskRequestParams(
+                    task_id=handle,
+                    meta=types.RequestParamsMeta(
+                        progress_token=self._next_task_token("poll")
+                    ),
+                )
+            ),
+            types.GetTaskResult,
+        )
+        status = _world_status(wire.status, wire.status_message)
+        progress = self._task_push.progress.get(handle, 0.0)
+        result: dict[str, Any] | None = None
+        error: str | None = None
+        if status == "completed":
+            progress = 1.0
+            payload = await self._session.send_request(
+                types.GetTaskPayloadRequest(
+                    params=types.GetTaskPayloadRequestParams(task_id=handle)
+                ),
+                _TaskResultPayload,
+            )
+            result = (payload.task or {}).get("result")
+        elif status == "failed":
+            error = wire.status_message
+        return TaskView(
+            handle=handle, status=status, progress=progress, result=result, error=error
+        )
+
+    async def cancel_task(self, handle: str) -> TaskView:
+        """Real tasks/cancel request."""
+        assert self._session is not None
+        wire = await self._session.send_request(
+            types.CancelTaskRequest(
+                params=types.CancelTaskRequestParams(task_id=handle)
+            ),
+            types.CancelTaskResult,
+        )
+        return TaskView(
+            handle=handle,
+            status=_world_status(wire.status, wire.status_message),
+            progress=self._task_push.progress.get(handle, 0.0),
+        )
+
+    async def list_tasks(self) -> list[TaskView]:
+        """Real tasks/list request (wire-level assertion surface; not part
+        of the common adapter view)."""
+        assert self._session is not None
+        wire = await self._session.send_request(types.ListTasksRequest(), types.ListTasksResult)
+        return [
+            TaskView(
+                handle=task.task_id,
+                status=_world_status(task.status, task.status_message),
+                progress=self._task_push.progress.get(task.task_id, 0.0),
+            )
+            for task in wire.tasks
+        ]
 
     async def close(self) -> None:
         if self._session_cm is not None:

@@ -46,7 +46,8 @@ from typing import Any
 from mcp_sdk_bench.benchmark.result import LATEST_DIR, new_run_id
 from mcp_sdk_bench.benchmark.sweep import REPO_ROOT
 
-#: The seven-tool contract (M2.1 six + M2.3a create_ticket, SPEC.md §21;
+#: The ten-tool contract (M2.1 six + M2.3a create_ticket + M3.2
+#: generate_monthly_report/get_report_task/cancel_report_task, SPEC.md §21;
 #: mirrors tests/conformance/helpers.py EXPECTED_TOOLS — duplicated because
 #: src must not import from tests).
 EXPECTED_TOOLS = frozenset(
@@ -58,6 +59,9 @@ EXPECTED_TOOLS = frozenset(
         "reserve_inventory",
         "deploy_service",
         "probe_schema",
+        "generate_monthly_report",
+        "get_report_task",
+        "cancel_report_task",
     }
 )
 

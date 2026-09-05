@@ -1,11 +1,14 @@
 """Shared benchmark world package (SPEC.md §5)."""
 from mcp_sdk_bench.world.fixtures import seed_world
-from mcp_sdk_bench.world.reset import reset_world
+from mcp_sdk_bench.world.reset import WORLD_STATE_FILE_ENV, reset_world
 from mcp_sdk_bench.world.state import (
     DEPLOYMENT_DECLINED,
     ELICIT_APPROVAL,
     ELICIT_CLARIFICATION,
+    MAX_ACTIVE_REPORT_TASKS,
     PROBE_SCHEMA_ENUM_VALUES,
+    REPORT_TASK_PROGRESS_STEPS,
+    REPORT_TASK_TTL_MS,
     Deployment,
     Document,
     ElicitationUnavailable,
@@ -16,6 +19,9 @@ from mcp_sdk_bench.world.state import (
     ProbeNestedItem,
     ProbeNestedObject,
     Project,
+    ReportTask,
+    ReportTaskStatus,
+    ReportTaskView,
     Ticket,
     TicketStatus,
     World,
@@ -23,14 +29,21 @@ from mcp_sdk_bench.world.state import (
     approval_payload,
     clarification_payload,
     elicitation_response,
+    load_task_tick_s,
+    report_task_view,
     requested_field,
+    task_timestamp,
 )
 
 __all__ = [
     "DEPLOYMENT_DECLINED",
     "ELICIT_APPROVAL",
     "ELICIT_CLARIFICATION",
+    "MAX_ACTIVE_REPORT_TASKS",
     "PROBE_SCHEMA_ENUM_VALUES",
+    "REPORT_TASK_PROGRESS_STEPS",
+    "REPORT_TASK_TTL_MS",
+    "WORLD_STATE_FILE_ENV",
     "Deployment",
     "Document",
     "ElicitFn",
@@ -41,6 +54,9 @@ __all__ = [
     "ProbeNestedItem",
     "ProbeNestedObject",
     "Project",
+    "ReportTask",
+    "ReportTaskStatus",
+    "ReportTaskView",
     "Ticket",
     "TicketStatus",
     "World",
@@ -48,7 +64,10 @@ __all__ = [
     "approval_payload",
     "clarification_payload",
     "elicitation_response",
+    "load_task_tick_s",
+    "report_task_view",
     "requested_field",
     "reset_world",
     "seed_world",
+    "task_timestamp",
 ]

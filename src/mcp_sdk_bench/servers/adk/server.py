@@ -51,6 +51,21 @@ into this variant. ``employee_id`` becomes optional in the schema (identical
 change in all three variants) so the missing-employee flow reaches the
 world's honest WorldError instead of a schema-validation error.
 
+M3.2 (SPEC.md §17 Tasks): the mcp 1.29.1 FastMCP serving surface exposes NO
+Tasks methods (no task request handlers, no task-capable client surface in
+ADK's McpToolset), so the three tools below (generate_monthly_report /
+get_report_task / cancel_report_task) are the APP-LEVEL equivalent — the
+same world task registry driven by plain tool calls, classified as such in
+docs/capability-matrix.md, never as protocol tasks. The framework-native
+long-running abstraction exists outside MCP: ADK 2.8.0 ships
+``google.adk.tools.LongRunningFunctionTool`` (verified in envs/adk). It is
+documented in the capability matrix and deliberately NOT wired into this
+variant (it would change the harness for one candidate only — SPEC.md §23).
+Like the other variants, the task tools bypass run_tool_with_faults by
+design: the M3.2 fault story is the world's asynchronous mid-task failure
+(one FaultEngine.task_failure() draw at task start, applied at the first
+progress tick).
+
 This module runs only in the ADK env. From the repo root:
 
     PYTHONPATH=src uv run --project envs/adk python -m mcp_sdk_bench.servers.adk
@@ -83,10 +98,13 @@ from mcp_sdk_bench.world import (
     InventoryItem,
     ProbeNestedItem,
     ProbeNestedObject,
+    ReportTaskView,
     Ticket,
     TicketStatus,
     World,
     WorldError,
+    load_task_tick_s,
+    report_task_view,
     reset_world,
 )
 
@@ -126,6 +144,12 @@ class DeploymentOutput(BaseModel):
 class ProbeSchemaOutput(BaseModel):
     received: dict[str, Any]
     count: int
+
+
+class ReportTaskOutput(BaseModel):
+    """M3.2 app-level task view envelope (identical across variants)."""
+
+    task: ReportTaskView
 
 
 class SchemaEnum(str, Enum):
@@ -313,6 +337,39 @@ def build_agent(world: World) -> LlmAgent:
             )
         )
 
+    async def generate_monthly_report() -> ReportTaskOutput:
+        """Start a simulated monthly-report task; returns the task handle and initial status (app-level task equivalent, SPEC.md §17)."""
+        # Bypasses the synchronous fault layer by design (module docstring).
+        try:
+            task = await world.start_report_task(fault_engine)
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+        return ReportTaskOutput(task=report_task_view(task))
+
+    async def get_report_task(
+        handle: Annotated[
+            str, Field(description="Task handle returned by generate_monthly_report")
+        ],
+    ) -> ReportTaskOutput:
+        """Poll a report task by handle; returns status and progress (app-level tasks/get equivalent, SPEC.md §17)."""
+        try:
+            task = world.get_report_task(handle)
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+        return ReportTaskOutput(task=report_task_view(task))
+
+    async def cancel_report_task(
+        handle: Annotated[
+            str, Field(description="Task handle returned by generate_monthly_report")
+        ],
+    ) -> ReportTaskOutput:
+        """Cancel a running report task by handle (app-level tasks/cancel equivalent, SPEC.md §17)."""
+        try:
+            task = await world.cancel_report_task(handle)
+        except WorldError as err:
+            raise ToolError(str(err)) from err
+        return ReportTaskOutput(task=report_task_view(task))
+
     tools = [
         FunctionTool(func=fn)
         for fn in (
@@ -323,6 +380,9 @@ def build_agent(world: World) -> LlmAgent:
             reserve_inventory,
             deploy_service,
             probe_schema,
+            generate_monthly_report,
+            get_report_task,
+            cancel_report_task,
         )
     ]
     return LlmAgent(
@@ -337,6 +397,9 @@ def create_server() -> FastMCP:
     """Build the ADK M1 server. A fresh seeded World is created here, so each
     server process owns exactly one in-memory world instance."""
     world: World = reset_world()
+    # M3.2: no update_hook — no server-pushed task notification surface on
+    # the mcp 1.x FastMCP serving path; clients poll (app-level).
+    world.set_task_runtime(tick_s=load_task_tick_s())
     agent = build_agent(world)
     # mcp 1.x FastMCP has no `version` kwarg (unlike FastMCP 4.x); the server
     # version is kept as a module constant for results/environment.json.
