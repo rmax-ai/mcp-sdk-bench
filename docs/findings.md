@@ -45,25 +45,27 @@ Evidence: `results/latest/failures.json` (run 20260904T125437Z); `tests/failures
 
 A model-backend outage mid-experiment (DeepSeek balance hit zero → 402 on every agent call) initially recorded plausible-looking **0.00 success / 0.60 bad_state rows**. The fail-loud guard `_raise_if_model_outage()` now aborts a cell when every run errored with zero tool calls. Evidence: `src/mcp_sdk_bench/benchmark/reliability.py`; `tests/failures/test_reliability.py`.
 
-## M3.1 — elicitation + multi-round-trip (2026-09-04)
+## M3.1 — elicitation + multi-round-trip (2026-09-04/05)
 
-Real F/G evals (N=3 × 3 SDKs, deepseek-v4-flash, 2 calibrated rounds):
+Real F/G evals (N=3 × 3 SDKs × 2 independent runs, deepseek-v4-flash; m31 = calibration pass, m31b = confirmation):
 
 | task | official | fastmcp | adk |
 |---|---|---|---|
 | f-01 ambiguous deploy (F) | 2/3 | 3/3 | 3/3 |
-| f-02 must-ask, no deploy (F) | 1/3 | 1/3 | 2/3 |
-| f-03 F-decline (F) | 3/3 | 3/3 | 3/3 |
+| f-02 must-ask, no deploy (F) | 1/3 | 2/3 | 2/3 |
+| f-03 user-declines (F) | 3/3 | 3/3 | 3/3 |
 | g-01 prod deploy, approve (G) | 0/3* | 1/3 | 0/3** |
-| g-02 prod deploy, decline (G) | 0/3* | 2/3 | 0/3*** |
+| g-02 prod deploy, decline (G) | 0/3* | 3/3 | 0/3*** |
 | g-03 reserve clarify (G) | 3/3 | 3/3 | 3/3 |
 
-- `*` official g-01/g-02: agents read the **deployment-policy resource** (change freeze, dual-approval) and refuse to attempt the deploy in most rounds — policy-following via resource access, not a flow failure. The approval path itself executes when attempted (rounds with ui≥1) and is proven hermetically (`tests/interactive/`).
+- f-03 (F-decline) scores the post-calibration redesign: a correct user-decline interaction counts as success (ui=1). Validated **9/9** with the user simulator engaging in every round — the calibration pass scored 0/3 on this task under the old "deploy attempted" semantics.
+- `*` official g-01/g-02: agents read the **deployment-policy resource** (change freeze, dual-approval) and refuse to attempt the deploy in most rounds — policy-following via resource access, not a flow failure. `correct_final_state` = 3/3 in both runs (world untouched). The approval path itself executes when attempted (rounds with ui≥1) and is proven hermetically (`tests/interactive/`).
 - `**` adk g-01: the deployment **proceeds unguarded** — no elicitation exists over mcp 1.x, and the legacy production guard only blocks cross-environment deploys. checkout→production succeeds with no human gate. Approval workflows are impossible on the ADK variant.
-- `***` adk g-02: the agent **fabricated a completed production deploy** ("deployment complete … active") — the world state shows otherwise. Category-G failure mode, SPEC §18 "failure modes".
+- `***` adk g-02: the agent **fabricated a completed production deploy** ("deployment complete … active") — the world state shows otherwise. Reproduced **6/6** across both independent runs. Category-G failure mode, SPEC §18 "failure modes".
+- Round-to-round variance (m31 → m31b): f-02 fastmcp 1/3→2/3, g-02 fastmcp 2/3→3/3, f-01 official 3/3→2/3. Qualitative findings unchanged across both runs.
 
 ### Cross-SDK findings
 
 - **Resource surface drives agent behavior.** Resource-visible SDKs (official, FastMCP) produce policy-respecting agents; the ADK variant (no MCP resource surface, M1 finding) produces unguarded production deployments. This is the capability gap made behavioral.
 - **Version-string normalization is pervasive** ("v1.7.0" → "1.7.0") across all SDKs and task types — `tool_argument_accuracy` ≈ 0.0–0.33 while final state stays correct. The grader now asserts environment+status and measures version fidelity separately (calibration, not leniency).
-- **Clarification flow works end-to-end on all three** (g-03 3/3 everywhere; f-03 3/3 everywhere) — the elicitation seam and user simulator are solid.
+- **Clarification flow works end-to-end on all three** (g-03 3/3 everywhere; f-03 9/9 post-redesign) — the elicitation seam and user simulator are solid.
