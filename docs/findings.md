@@ -69,3 +69,18 @@ Real F/G evals (N=3 × 3 SDKs × 2 independent runs, deepseek-v4-flash; m31 = ca
 - **Resource surface drives agent behavior.** Resource-visible SDKs (official, FastMCP) produce policy-respecting agents; the ADK variant (no MCP resource surface, M1 finding) produces unguarded production deployments. This is the capability gap made behavioral.
 - **Version-string normalization is pervasive** ("v1.7.0" → "1.7.0") across all SDKs and task types — `tool_argument_accuracy` ≈ 0.0–0.33 while final state stays correct. The grader now asserts environment+status and measures version fidelity separately (calibration, not leniency).
 - **Clarification flow works end-to-end on all three** (g-03 3/3 everywhere; f-03 9/9 post-redesign) — the elicitation seam and user simulator are solid.
+- **Clarification flow works end-to-end on all three** (g-03 3/3 everywhere; f-03 9/9 post-redesign) — the elicitation seam and user simulator are solid.
+
+## M3.2 — MCP Tasks extension (2026-09-05, deterministic)
+
+Hermetic, no LLM calls. Official variant drives **real protocol Tasks** (tasks/get, tasks/cancel, tasks/list, tasks/result + server-pushed notifications/progress and notifications/tasks/status per tick); fastmcp/adk variants drive the identical world task registry through plain tools (app-level, classified as such). Gates: 213 passed / 20 skipped main env, 10 passed envs/adk, all 5 interop pairings on the new 10-tool contract.
+
+SDK gaps discovered while implementing protocol tasks against the official SDK 2.1.1 (all verified against installed sources, recorded in `servers/official/server.py` + `docs/capability-matrix.md`):
+
+- **High-level framework has zero Tasks support** — `mcp.server.mcpserver` and `ServerSession` expose no task API, but the low-level `Server.add_request_handler` dispatches any registered method (tasks/* are absent from the per-version method sieve tables), so protocol tasks are implementable only via the low-level API.
+- **`GetTaskPayloadResult` carries no payload field** — `tasks/result` must return a plain JSON object; the client needs a custom envelope type because `send_request`'s result TypeVar is bound to BaseModel.
+- **`ClientSession._build_capabilities` hardcodes sampling/elicitation/roots** — a client cannot advertise `ClientTasksCapability`; opt-in is the request `_meta.progressToken` (the only client→server per-request channel exposed).
+- **`Server.get_capabilities` never populates `ServerCapabilities.tasks`** — `ServerTasksCapability` must be set explicitly in the capabilities block.
+- **`notifications/tasks/status` is absent from every per-version method table** — it arrives only through a `NotificationBinding` on the client; `notifications/progress` parses at the negotiated version.
+
+FastMCP 4.0.2: no Tasks surface anywhere (server, client, Context) — server-pushed task notifications impossible, clients poll. ADK (mcp 1.x): no MCP Tasks; google-adk 2.8.0 ships `LongRunningFunctionTool` as a framework-native alternative (documented in the capability matrix, deliberately not wired — the independent variable is the MCP integration, SPEC.md §23).
